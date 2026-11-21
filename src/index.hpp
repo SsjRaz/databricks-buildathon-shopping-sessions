@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -105,36 +106,40 @@ inline uint64_t packed_alias_hash(uint64_t key) {
     return mixed ^ (mixed >> 32);
 }
 
-// Packed alias lookups use one 16-byte slot for the exact ID and its canonical
-// code. The value is a union-find node index until resolve() maps it in place.
+// Probe exact keys in a compact array. A miss need not read the values array.
 class PackedAliasIndex {
 public:
     static constexpr uint64_t missing = UINT64_MAX;
 
 private:
-    struct Slot {
-        uint64_t key = 0;
-        uint64_t value = missing;
-    };
-    static_assert(sizeof(Slot) == 16);
-
-    std::vector<Slot> slots;
+    std::vector<uint64_t> keys;
+    std::unique_ptr<uint64_t[]> values;
     size_t initial_capacity;
     unsigned partition_bits;
     size_t used = 0;
 
     size_t locate(uint64_t key, uint64_t hash) const {
-        const size_t mask = slots.size() - 1;
+        const size_t mask = keys.size() - 1;
         size_t i = (hash >> partition_bits) & mask;
-        while (slots[i].value != missing && slots[i].key != key) i = (i + 1) & mask;
+        while (keys[i] != missing && keys[i] != key) i = (i + 1) & mask;
         return i;
     }
 
+    void allocate(size_t capacity) {
+        keys.assign(capacity, missing);
+        values = std::make_unique_for_overwrite<uint64_t[]>(capacity);
+    }
+
     void grow() {
-        auto old = std::move(slots);
-        slots.resize(old.size() * 2);
-        for (const Slot& entry : old) {
-            if (entry.value != missing) slots[locate(entry.key, packed_alias_hash(entry.key))] = entry;
+        auto old_keys = std::move(keys);
+        auto old_values = std::move(values);
+        allocate(old_keys.size() * 2);
+        for (size_t i = 0; i < old_keys.size(); ++i) {
+            const uint64_t key = old_keys[i];
+            if (key == missing) continue;
+            const size_t slot = locate(key, packed_alias_hash(key));
+            keys[slot] = key;
+            values[slot] = old_values[i];
         }
     }
 
@@ -144,28 +149,30 @@ public:
           partition_bits(partition_bits) {}
 
     uint64_t find(uint64_t key, uint64_t hash) const {
-        if (slots.empty()) return missing;
-        return slots[locate(key, hash)].value;
+        if (keys.empty()) return missing;
+        const size_t slot = locate(key, hash);
+        return keys[slot] == missing ? missing : values[slot];
     }
 
     std::pair<uint32_t, bool> try_add(uint64_t key, uint32_t index) {
-        if (index == StringIndex::missing) throw std::logic_error("invalid alias index entry");
-        if (slots.empty()) slots.resize(initial_capacity);
+        if (key == missing || index == StringIndex::missing) throw std::logic_error("invalid alias index entry");
+        if (keys.empty()) allocate(initial_capacity);
         const uint64_t hash = packed_alias_hash(key);
         size_t i = locate(key, hash);
-        if (slots[i].value != missing) return {static_cast<uint32_t>(slots[i].value), false};
-        if (used + 1 > slots.size() * 2 / 3) {
+        if (keys[i] != missing) return {static_cast<uint32_t>(values[i]), false};
+        if (used + 1 > keys.size() * 2 / 3) {
             grow();
             i = locate(key, hash);
         }
-        slots[i] = {key, index};
+        keys[i] = key;
+        values[i] = index;
         ++used;
         return {index, true};
     }
 
     void resolve(std::span<const size_t> canonical) {
-        for (Slot& entry : slots) {
-            if (entry.value != missing) entry.value = canonical[entry.value];
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] != missing) values[i] = canonical[values[i]];
         }
     }
 };

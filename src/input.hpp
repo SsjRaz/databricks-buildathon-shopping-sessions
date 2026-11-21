@@ -133,66 +133,89 @@ bool fields(Text line, std::array<Text, Count>& out) {
 template<size_t Count, class Fn>
 void read(Text bytes, Fn&& fn) {
     std::array<Text, Count> record;
-#ifdef __AVX2__
+#if defined(__AVX2__) && defined(__BMI2__)
+    static_assert(Count > 0 && Count < 63, "field masks must fit in one word");
+    const char* start = bytes.data();
     if (bytes.empty()) return;
-    const char* block = bytes.data();
-    const char* end = block + bytes.size();
-    const char* first = block;
-    size_t field = 0;
-    size_t quotes = 0;
-    bool malformed = false;
-
-    auto finish_field = [&](const char* last, bool end_of_line) {
-        if (!malformed && (field == Count - 1) == end_of_line) {
-            if (quotes == 0) {
-                record[field] = Text(first, last - first);
-            } else if (quotes == 2 && *first == '"' && last[-1] == '"') {
-                record[field] = Text(first + 1, last - first - 2);
-            } else {
-                malformed = true;
+    const char* end = start + bytes.size();
+    while (end - start >= 128) {
+        // Load two contiguous 64-byte masks. Most records fit in this window.
+        // Mask off subsequent records before interpreting an index.
+        auto masks = [](const char* p, uint64_t& separators, uint64_t& quotes, uint64_t& lfs) {
+            const auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+            const auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
+            auto mask = [a,b](char target) {
+                const auto x = _mm256_set1_epi8(target);
+                const auto lo = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, x)));
+                const auto hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, x)));
+                return lo | (uint64_t{hi} << 32);
+            };
+            lfs = mask('\n');
+            separators = mask(',') | lfs;
+            quotes = mask('"');
+        };
+        uint64_t lo, qlo, lflo, hi = 0, qhi = 0, lfhi = 0;
+        masks(start, lo, qlo, lflo);
+        if (lflo == 0) masks(start + 64, hi, qhi, lfhi);
+        const char* newline;
+        if (lflo != 0) {
+            const auto offset = std::countr_zero(lflo);
+            newline = start + offset;
+            const uint64_t through = lflo ^ (lflo - 1);
+            lo &= through;
+            qlo &= through;
+        } else if (lfhi != 0) {
+            const auto offset = std::countr_zero(lfhi);
+            newline = start + 64 + offset;
+            const uint64_t through = lfhi ^ (lfhi - 1);
+            hi &= through;
+            qhi &= through;
+        } else {
+            newline = find_byte(start + 128, end, '\n');
+            if (fields(Text(start, newline - start), record)) fn(record);
+            start = newline == end ? end : newline + 1;
+            continue;
+        }
+        const size_t low_count = std::popcount(lo);
+        if (low_count + std::popcount(hi) == Count) {
+            const uint64_t low_before = (lo << 1) | 1;
+            const uint64_t low_after = (lo >> 1) | (hi << 63);
+            const uint64_t high_before = (hi << 1) | (lo >> 63);
+            const uint64_t high_after = hi >> 1;
+            const bool interior_or_single = (qlo & ~(low_before ^ low_after)) ||
+                                             (qhi & ~(high_before ^ high_after));
+            // The next and previous quote of each delimiter describe the
+            // beginning and end of adjacent fields, including the first.
+            const uint64_t opening = ((qlo & 1) |
+                (_pext_u64((qlo >> 1) | (qhi << 63), lo) << 1) |
+                (_pext_u64(qhi >> 1, hi) << (low_count + 1)));
+            const uint64_t closing = _pext_u64(qlo << 1, lo) |
+                         (_pext_u64((qhi << 1) | (qlo >> 63), hi) << low_count);
+            if (!interior_or_single && opening == closing) {
+                std::array<unsigned, Count> ends;
+                // Extra low-word positions are replaced by the high word.
+                for (size_t i = 0; i < Count; ++i) {
+                    ends[i] = std::countr_zero(lo);
+                    lo &= lo - 1;
+                }
+                for (size_t i = 0; hi; ++i) {
+                    ends[low_count + i] = 64 + std::countr_zero(hi);
+                    hi &= hi - 1;
+                }
+                size_t first = 0;
+                for (size_t i = 0; i < Count; ++i) {
+                    const size_t q = (opening >> i) & 1;
+                    record[i] = Text(start + first + q, ends[i] - first - 2 * q);
+                    first = ends[i] + 1;
+                }
+                fn(record);
             }
-        } else {
-            malformed = true;
         }
-        if (end_of_line) {
-            if (!malformed) fn(record);
-            field = 0;
-            malformed = false;
-        } else {
-            ++field;
-        }
-        first = last == end ? end : last + 1;
-        quotes = 0;
-    };
-
-    const auto comma = _mm256_set1_epi8(',');
-    const auto newline = _mm256_set1_epi8('\n');
-    const auto quote = _mm256_set1_epi8('"');
-    auto scan = [&](const char* position, __m256i values) {
-        const auto commas = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(values, comma)));
-        const auto newlines = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(values, newline)));
-        auto quote_bits = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(values, quote)));
-        for (uint32_t separators = commas | newlines; separators != 0; separators &= separators - 1) {
-            const unsigned offset = std::countr_zero(separators);
-            const uint32_t bit = uint32_t{1} << offset;
-            const uint32_t earlier = bit - 1;
-            quotes += std::popcount(quote_bits & earlier);
-            quote_bits &= ~earlier;
-            finish_field(position + offset, (newlines & bit) != 0);
-        }
-        quotes += std::popcount(quote_bits);
-    };
-
-    while (end - block >= 32) {
-        scan(block, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block)));
-        block += 32;
+        start = newline + 1;
     }
-    if (block != end) {
-        alignas(32) char tail[32]{};
-        std::memcpy(tail, block, end - block);
-        scan(block, _mm256_load_si256(reinterpret_cast<const __m256i*>(tail)));
-    }
-    if (first != end || field != 0) finish_field(end, true);
+    lines(Text(start, end - start), [&](Text line) {
+        if (fields(line, record)) fn(record);
+    });
 #else
     lines(bytes, [&](Text line) {
         if (fields(line, record)) fn(record);
@@ -244,7 +267,7 @@ inline int32_t calendar_day(const char* p) {
 
     // Index by the day of the month for the common case where most rows are
     // from one short window. Compare all ten date bytes before reusing a day.
-    const unsigned slot = ((p[8] & 15) * 10 + (p[9] & 15)) & (cache.size() - 1);
+    const unsigned slot = ((p[8] & 3) << 4) | (p[9] & 15);
     auto& entry = cache[slot];
     if (entry.prefix == prefix && entry.suffix == suffix) return entry.days;
 
@@ -266,20 +289,48 @@ inline int32_t calendar_day(const char* p) {
     return result;
 }
 
+// Compare and decode HH:MM:SS from a single, bounded eight-byte load.
+// XOR turns the expected delimiters into zeroes and ASCII digits into
+// nibbles. A high nibble or a carry out of the permitted low digit rejects
+// that byte. A separate hour check covers the upper bound of 23.
+inline uint64_t clock_digits(const char* p) {
+    uint64_t bytes;
+    std::memcpy(&bytes, p, sizeof(bytes));
+    return bytes ^ 0x30303a30303a3030ULL;
+}
+
+inline bool valid_clock(uint64_t digits) {
+    constexpr uint64_t high = 0xf0f0f0f0f0f0f0f0ULL;
+    constexpr uint64_t bias = 0x060a0f060a0f060dULL;
+    return ((digits | (digits + bias)) & high) == 0 &&
+           ((digits & 0xff) != 2 || ((digits >> 8) & 0xff) <= 3);
+}
+
+inline int clock_seconds(uint64_t digits) {
+#ifdef __AVX2__
+    // The two colon lanes have zero weight. The intermediate values are
+    // hour, tens of minutes, units of minutes and seconds.
+    const __m128i pairs = _mm_maddubs_epi16(_mm_cvtsi64_si128(digits),
+                                            _mm_setr_epi8(10, 1, 0, 10, 1, 0, 10, 1,
+                                                          0, 0, 0, 0, 0, 0, 0, 0));
+    const __m128i parts = _mm_madd_epi16(pairs, _mm_setr_epi16(3600, 60, 60, 1, 0, 0, 0, 0));
+    return _mm_cvtsi128_si32(parts) + _mm_extract_epi32(parts, 1);
+#else
+    const uint64_t pairs = (digits * 10 + (digits >> 8));
+    return static_cast<int>(pairs & 255) * 3600 +
+           static_cast<int>((pairs >> 24) & 255) * 60 +
+           static_cast<int>((pairs >> 48) & 255);
+#endif
+}
+
 inline int64_t iso_time(Text text) {
     const bool zulu = text.size() == 20;
     if (!zulu && text.size() != 25) return invalid_time;
     const char* p = text.data();
-    if (p[10] != 'T' || p[13] != ':' || p[16] != ':') return invalid_time;
+    const uint64_t digits = clock_digits(p + 11);
     const int32_t day = calendar_day(p);
-    const int hour = pair(p + 11);
-    const int minute = pair(p + 14);
-    const int second = pair(p + 17);
-    if (day == invalid_day || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
-        second < 0 || second > 59) {
-        return invalid_time;
-    }
-    int offset = 0;
+    if (p[10] != 'T' || !valid_clock(digits) || day == invalid_day) return invalid_time;
+    int seconds = clock_seconds(digits);
     if (zulu) {
         if (p[19] != 'Z') return invalid_time;
     } else {
@@ -287,9 +338,10 @@ inline int64_t iso_time(Text text) {
         const int h = pair(p + 20);
         const int m = pair(p + 23);
         if (h < 0 || h > 23 || m < 0 || m > 59) return invalid_time;
-        offset = (h * 60 + m) * (p[19] == '-' ? -1 : 1);
+        const int offset = (h * 60 + m) * 60;
+        seconds += p[19] == '-' ? offset : -offset;
     }
-    return day * day_ms + ((hour * 60 + minute - offset) * 60 + second) * int64_t{1000};
+    return day * day_ms + seconds * int64_t{1000};
 }
 
 inline uint64_t decimal(Text text, uint64_t limit) {
@@ -322,10 +374,27 @@ inline uint32_t eight_digits(const char* p) {
 
 inline int64_t timestamp(Text text) {
     if (text.size() == 13) {
+#ifdef __AVX2__
+        // Two in-bounds loads cover all 13 bytes. Validate the digits
+        // together, then expand the leading five to an eight-digit group.
+        const __m128i input = _mm_unpacklo_epi64(_mm_loadu_si64(text.data()),
+                                                  _mm_loadu_si64(text.data() + 5));
+        const __m128i digits = _mm_sub_epi8(input, _mm_set1_epi8('0'));
+        const __m128i excess = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+        if (!_mm_testz_si128(excess, excess)) return invalid_time;
+        const __m128i grouped = _mm_shuffle_epi8(digits,
+            _mm_setr_epi8(-1, -1, -1, 0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15));
+        const __m128i pairs = _mm_maddubs_epi16(grouped, _mm_set1_epi16(0x010a));
+        const __m128i fours = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+        const __m128i eights = _mm_madd_epi16(_mm_packs_epi32(fours, fours),
+                                              _mm_set1_epi32(0x00012710));
+        return int64_t{_mm_cvtsi128_si32(eights)} * 100000000 + _mm_extract_epi32(eights, 1);
+#else
         const uint32_t first = eight_digits(text.data());
         const uint32_t last = eight_digits(text.data() + 5);
         if (first == UINT32_MAX || last == UINT32_MAX) return invalid_time;
         return int64_t{first} * 100000 + last % 100000;
+#endif
     }
     if ((text.size() == 20 || text.size() == 25) && text[4] == '-') return iso_time(text);
     const uint64_t value = decimal(text, INT64_MAX);

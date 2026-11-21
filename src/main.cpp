@@ -739,9 +739,22 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         const auto day = static_cast<int32_t>(key >> 32);
         campaign_rows[0].push_back({lookups.campaign[campaign], lookups.channel[campaign], day, value});
     }
-    parquet::write_table(output / "user_daily", std::span<const parquet::Field<UserDay>>(user_fields),
-                         user_rows);
-    parquet::write_table(output / "campaign_daily",
+    // Write a fixed set of parts, including empty parts, so a subsequent run
+    // in the same output directory replaces every prior user table part.
+    constexpr size_t output_parts = 8;
+    static_assert(partitions % output_parts == 0);
+    constexpr size_t shards_per_part = partitions / output_parts;
+    const auto user_output = output / "user_daily";
+    const auto campaign_output = output / "campaign_daily";
+    fs::create_directories(user_output);
+    fs::create_directories(campaign_output);
+    const std::span<const std::vector<UserDay>> rows(user_rows);
+    parallel(output_parts, threads, [&](size_t, size_t part) {
+        parquet::write_table(user_output / ("part-" + std::to_string(part) + ".parquet"),
+                             std::span<const parquet::Field<UserDay>>(user_fields),
+                             rows.subspan(part * shards_per_part, shards_per_part));
+    });
+    parquet::write_table(campaign_output / "part-0.parquet",
                          std::span<const parquet::Field<CampaignDay>>(campaign_fields), campaign_rows);
     timer.mark("merge and write Parquet");
 }

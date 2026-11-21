@@ -241,8 +241,7 @@ public:
 template<class Row, class Groups>
 void write_table(const std::filesystem::path& path, std::span<const Field<Row>> fields,
                  const Groups& groups) {
-    std::filesystem::create_directories(path);
-    Writer writer(path / "part-0.parquet", fields);
+    Writer writer(path, fields);
     constexpr size_t batch_size = 65536;
     for (const auto& group : groups) {
         std::span<const Row> rows(group);

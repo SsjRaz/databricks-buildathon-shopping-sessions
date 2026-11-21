@@ -204,7 +204,8 @@ class LinkedIds {
         nodes[first].size += nodes[second].size;
     }
 
-    void build_forest(const std::vector<input::Mapping>& links, size_t bytes, size_t expected_aliases) {
+    std::vector<Edge> build_forest(const std::vector<input::Mapping>& links, size_t bytes,
+                                   size_t expected_aliases) {
         constexpr size_t edge_reserve_limit = 4 * 1024 * 1024;
         const size_t endpoint_hint = std::min(bytes / 8, 2 * edge_reserve_limit);
         const size_t per_shard = (endpoint_hint + partitions - 1) / partitions;
@@ -242,6 +243,7 @@ class LinkedIds {
             std::vector<PackedEndpoint>().swap(pending);
         }
         for (const auto& edge : edges) join(edge);
+        return edges;
     }
 
 public:
@@ -251,7 +253,7 @@ public:
         const size_t expected = std::min<size_t>(bytes / 16, 4 * 1024 * 1024);
         nodes.reserve(expected);
         alias_names.reserve(expected);
-        build_forest(links, bytes, expected);
+        const auto edges = build_forest(links, bytes, expected);
         // The forest is now fixed. Compress to final roots while reducing
         // names into root slots; a non-root slot still holds its original ID.
         for (uint32_t i = 0; i < nodes.size(); ++i) {
@@ -261,14 +263,19 @@ public:
             auto& name = alias_names[node.parent];
             if (alias_names[i] < name) name = alias_names[i];
         }
-        canonical.resize(nodes.size());
-        for (uint32_t i = 0; i < nodes.size(); ++i) {
-            if (nodes[i].parent != i) continue;
-            const Text name = alias_names[i];
-            const size_t part = shard(text_hash(name));
-            auto& names = names_by_partition[part];
-            canonical[i] = names.size() * partitions + part;
-            names.push_back(name);
+        // Interning by shard changes node ordinals. Fold roots in their
+        // first input occurrence order to retain the established layout.
+        constexpr size_t unpublished = std::numeric_limits<size_t>::max();
+        canonical.resize(nodes.size(), unpublished);
+        for (const auto& edge : edges) {
+            for (const uint32_t i : edge) {
+                if (nodes[i].parent != i || canonical[i] != unpublished) continue;
+                const Text name = alias_names[i];
+                const size_t part = shard(text_hash(name));
+                auto& names = names_by_partition[part];
+                canonical[i] = names.size() * partitions + part;
+                names.push_back(name);
+            }
         }
         for (uint32_t i = 0; i < nodes.size(); ++i) canonical[i] = canonical[nodes[i].parent];
         for (auto& ids : packed_ids) ids.resolve(canonical);

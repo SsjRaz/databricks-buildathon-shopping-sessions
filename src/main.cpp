@@ -397,14 +397,39 @@ struct Event {
     uint32_t price, category;
 };
 
-struct Click {
-    PersonKey alias;
-    Text id;
+struct TimedClick {
+    static constexpr uint32_t wide_id = UINT32_MAX;
+
+    union {
+        const char* bytes;
+        const Text* full;
+    } id;
     int64_t time;
     uint32_t campaign;
+    uint32_t length;
+
+    Text id_text() const {
+        return length == wide_id ? *id.full : Text(id.bytes, length);
+    }
+};
+
+struct Click {
+    PersonKey alias;
+    TimedClick row;
 };
 static_assert(sizeof(Event) == 24);
-static_assert(sizeof(Click) == 40);
+static_assert(sizeof(TimedClick) == 24);
+static_assert(sizeof(Click) == 32);
+
+TimedClick make_timed_click(Text id, int64_t time, uint32_t campaign, std::deque<Text>& wide_ids) {
+    if (id.size() < TimedClick::wide_id) {
+        return {{.bytes = id.data()}, time, campaign, static_cast<uint32_t>(id.size())};
+    }
+    // The source mapping owns the bytes. The deque keeps the full-width
+    // Text view stable while its parsing lane appends more IDs.
+    wide_ids.push_back(id);
+    return {{.full = &wide_ids.back()}, time, campaign, TimedClick::wide_id};
+}
 
 CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window window,
                                const Lookups& lookups) {
@@ -533,7 +558,7 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event>& ev
 }
 
 void read_clicks(Text chunk, Shards<Click>& clicks, const Lookups& lookups, input::Window window,
-                 std::vector<Text>& raw_names, size_t worker) {
+                 std::vector<Text>& raw_names, size_t worker, std::deque<Text>& wide_ids) {
     input::read<4>(chunk, [&](const auto& row) {
         if (row[0].empty() || row[1].empty()) return;
         const int64_t time = input::timestamp(row[3]);
@@ -541,19 +566,14 @@ void read_clicks(Text chunk, Shards<Click>& clicks, const Lookups& lookups, inpu
         const auto campaign = lookups.campaigns.find(row[2]);
         if (campaign == lookups.campaigns.end()) return;
         const auto destination = routed_alias(row[1], pack_short_id(row[1]), raw_names, worker);
-        clicks[destination.partition].push_back({destination.key, row[0], time, campaign->second});
+        const TimedClick click = make_timed_click(row[0], time, campaign->second, wide_ids);
+        clicks[destination.partition].push_back({destination.key, click});
     });
 }
 
 struct TimedEvent {
     int64_t time;
     uint32_t price, category;
-};
-
-struct TimedClick {
-    Text id;
-    int64_t time;
-    uint32_t campaign;
 };
 
 struct AliasGroup {
@@ -641,7 +661,7 @@ AliasStorage group_aliases(std::vector<Shards<Event>>& event_lanes,
     for (auto& lane : click_lanes) {
         for (const Click& click : lane[part]) {
             const size_t offset = groups[click_group[i++]].click_end++;
-            storage.clicks[offset] = {click.id, click.time, click.campaign};
+            storage.clicks[offset] = click.row;
         }
         std::vector<Click>().swap(lane[part]);
     }
@@ -781,7 +801,7 @@ void summarize_person_fragments(std::array<FragmentShards, partitions>& fragment
         });
         if (clicks.size() > 1) {
             std::sort(clicks.begin(), clicks.end(), [](const auto& a, const auto& b) {
-                return a.time != b.time ? a.time < b.time : a.id < b.id;
+                return a.time != b.time ? a.time < b.time : a.id_text() < b.id_text();
             });
         }
         attribution.next_person(clicks);
@@ -935,6 +955,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     std::vector<Shards<Candidate>> candidate_lanes(threads);
     std::vector<Shards<Event>> event_lanes(threads);
     std::vector<Shards<Click>> click_lanes(threads);
+    std::vector<std::deque<Text>> wide_click_ids(threads);
     RawNameLanes raw_names(threads);
 
     parallel(1 + event_chunks.size() + click_chunks.size(), threads, [&](size_t lane, size_t job) {
@@ -945,7 +966,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         --job;
         if (job >= event_chunks.size()) {
             read_clicks(click_chunks[job - event_chunks.size()], click_lanes[lane],
-                        lookups, window, raw_names[lane], lane);
+                        lookups, window, raw_names[lane], lane, wide_click_ids[lane]);
             return;
         }
         if (candidate_hint >= 1024 && packed_candidate_lanes[lane][0].capacity() == 0) {

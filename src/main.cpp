@@ -858,6 +858,17 @@ class Attribution {
     std::span<const TimedClick> clicks;
     size_t left = 0, right = 0, latest = 0;
 
+    void record(uint32_t winner, int64_t revenue, const DayCampaignTotals& totals) const {
+        if (totals.credits != nullptr) {
+            totals.credits[winner].credit(revenue);
+            for (uint32_t campaign : active) ++totals.assists[campaign];
+        } else {
+            auto& sparse = *totals.sparse;
+            sparse[totals.day_key | winner].credit(revenue);
+            for (uint32_t campaign : active) ++sparse[totals.day_key | campaign].assists;
+        }
+    }
+
 public:
     explicit Attribution(size_t campaigns) : counts(campaigns) {}
     void next_person(std::span<const TimedClick> person_clicks) {
@@ -865,6 +876,28 @@ public:
         active.clear();
         clicks = person_clicks;
         left = right = latest = 0;
+    }
+
+    void credit_single(int64_t start, int64_t revenue, std::span<const TimedClick> person_clicks,
+                       const DayCampaignTotals& totals) {
+        next_person(person_clicks);
+        const TimedClick* winner = nullptr;
+        for (const auto& click : person_clicks) {
+            if (click.time > start ||
+                static_cast<uint64_t>(start) - static_cast<uint64_t>(click.time) > input::week_ms) {
+                continue;
+            }
+            if (winner == nullptr || click.time > winner->time ||
+                (click.time == winner->time && click.id_text() < winner->id_text())) {
+                winner = &click;
+            }
+            auto& count = counts[click.campaign].count;
+            if (count == 0) {
+                count = 1;
+                active.push_back(click.campaign);
+            }
+        }
+        record(winner == nullptr ? 0 : winner->campaign, revenue, totals);
     }
 
     void credit(int64_t start, int64_t revenue, const DayCampaignTotals& totals) {
@@ -896,22 +929,16 @@ public:
         // Exact duplicate clicks cannot change the winning ID or the set of
         // active campaigns. Their multiplicity expires at the same instant.
         const uint32_t winner = left == right ? 0 : clicks[latest].campaign;
-        if (totals.credits != nullptr) {
-            totals.credits[winner].credit(revenue);
-            for (uint32_t campaign : active) ++totals.assists[campaign];
-        } else {
-            auto& sparse = *totals.sparse;
-            sparse[totals.day_key | winner].credit(revenue);
-            for (uint32_t campaign : active) ++sparse[totals.day_key | campaign].assists;
-        }
+        record(winner, revenue, totals);
     }
 };
 
 template<class TimelineEvent>
 void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partitions>& fragments,
                                 size_t part, std::span<const Text> linked_names, const RawNameLanes& raw_names,
-                                DecodedNames& decoded_names, const Lookups& lookups, int64_t origin,
+                                DecodedNames& decoded_names, const Lookups& lookups, input::Window window,
                                 std::vector<UserDay>& users, CampaignTotals& campaigns) {
+    const int64_t origin = window.start;
     Attribution attribution(lookups.campaign.size());
     std::vector<int64_t> category_revenue(lookups.category.size());
     std::vector<uint32_t> purchased_categories;
@@ -929,17 +956,136 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
         users.push_back(daily);
     };
 
-    const auto summarize_timeline = [&](Text person, std::span<TimelineEvent> events, std::span<TimedClick> clicks) {
-        if (events.empty()) return;
-        std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
-            return a.sort_key() < b.sort_key();
-        });
+    const auto prepare_clicks = [&](std::span<TimedClick> clicks) {
         if (clicks.size() > 1) {
             std::sort(clicks.begin(), clicks.end(), [](const auto& a, const auto& b) {
                 return a.time != b.time ? a.time < b.time : a.id_text() < b.id_text();
             });
         }
         attribution.next_person(clicks);
+    };
+
+    constexpr size_t minimum_bucket_events = 16;
+    constexpr size_t maximum_buckets = 2048;
+    constexpr size_t maximum_categories = 64;
+    constexpr uint64_t width = session_gap;
+    static_assert(maximum_buckets <= UINT16_MAX + 1);
+    static_assert(maximum_buckets * width <= (uint64_t{1} << 32));
+    const uint64_t span = static_cast<uint64_t>(window.end) - static_cast<uint64_t>(origin);
+    const uint64_t buckets = 1 + (span - 1) / width; // The manifest window is nonempty.
+    const size_t categories = lookups.category.size();
+    const auto use_buckets = [&](size_t event_count) {
+        return event_count >= minimum_bucket_events && buckets <= maximum_buckets &&
+               categories <= maximum_categories;
+    };
+
+    struct Bin {
+        uint32_t first, last;
+        size_t count = 0;
+        uint64_t purchased = 0;
+    };
+    std::vector<Bin> bins;
+    std::vector<uint16_t> touched;
+    std::unique_ptr<int64_t[]> by_category;
+    const auto summarize_buckets = [&](Text person, std::span<TimedClick> clicks, auto&& visit_spans) {
+        if (bins.empty()) {
+            bins.resize(buckets);
+            touched.reserve(buckets);
+        }
+        touched.clear();
+        visit_spans([&](std::span<const TimelineEvent> events) {
+            for (const auto& event : events) {
+                const auto offset = static_cast<uint32_t>(static_cast<uint64_t>(event.absolute_time(origin)) -
+                                                          static_cast<uint64_t>(origin));
+                const size_t bucket = offset / width;
+                auto& bin = bins[bucket];
+                if (bin.count == 0) {
+                    touched.push_back(static_cast<uint16_t>(bucket));
+                    bin.first = bin.last = offset;
+                } else {
+                    bin.first = std::min(bin.first, offset);
+                    bin.last = std::max(bin.last, offset);
+                }
+                ++bin.count;
+                if (const uint32_t price = event.price(); price != 0) {
+                    if (!by_category) by_category = std::make_unique_for_overwrite<int64_t[]>(buckets * categories);
+                    const uint32_t category = event.category();
+                    auto& subtotal = by_category[bucket * categories + category];
+                    const uint64_t bit = uint64_t{1} << category;
+                    if (bin.purchased & bit) {
+                        subtotal += price;
+                    } else {
+                        subtotal = price;
+                        bin.purchased |= bit;
+                    }
+                }
+            }
+        });
+
+        // Events in one half-open half-hour bucket cannot split a session.
+        // Only boundaries between occupied buckets matter.
+        UserDay daily{person, {}, 0};
+        DayCampaignTotals day_totals;
+        int64_t start = 0, revenue = 0;
+        uint64_t last = 0;
+        bool started = false;
+        bool multiple_sessions = false;
+        std::sort(touched.begin(), touched.end());
+        for (size_t i : touched) {
+            auto& bin = bins[i];
+            if (!started || bin.first - last > width) {
+                if (started) {
+                    if (!multiple_sessions) {
+                        prepare_clicks(clicks);
+                        multiple_sessions = true;
+                    }
+                    attribution.credit(start, revenue, day_totals);
+                }
+                // Eligible windows bound every relative offset to maximum_buckets * width.
+                start = origin + static_cast<int64_t>(bin.first);
+                revenue = 0;
+                const int32_t day = utc_day(start);
+                if (!started || day != daily.day) {
+                    if (started) finish_day(daily);
+                    daily = {person, {}, day};
+                    day_totals = campaigns.day(day);
+                }
+                started = true;
+                ++daily.sessions;
+            }
+            last = bin.last;
+            daily.events += bin.count;
+            // A cleared mask makes the previous subtotals unreachable.
+            for (uint64_t remaining = bin.purchased; remaining != 0; remaining &= remaining - 1) {
+                const size_t category = std::countr_zero(remaining);
+                const int64_t subtotal = by_category[i * categories + category];
+                auto& sum = category_revenue[category];
+                if (sum == 0) purchased_categories.push_back(category);
+                sum += subtotal;
+                daily.revenue += subtotal;
+                revenue += subtotal;
+            }
+            bin.purchased = 0;
+            bin.count = 0;
+        }
+        if (multiple_sessions) {
+            attribution.credit(start, revenue, day_totals);
+        } else {
+            attribution.credit_single(start, revenue, clicks, day_totals);
+        }
+        finish_day(daily);
+    };
+
+    const auto summarize_timeline = [&](Text person, std::span<TimelineEvent> events, std::span<TimedClick> clicks) {
+        if (events.empty()) return;
+        if (use_buckets(events.size())) {
+            summarize_buckets(person, clicks, [&](const auto& collect) { collect(events); });
+            return;
+        }
+        std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
+            return a.sort_key() < b.sort_key();
+        });
+        prepare_clicks(clicks);
 
         size_t cursor = 0;
         UserDay daily{person, {}, utc_day(events[cursor].absolute_time(origin))};
@@ -1011,21 +1157,30 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
         }
         if (event_count == 0) continue;
 
-        // A multi-alias person needs one contiguous sequence for the
-        // existing comparison sorts. Reuse scratch across these merges.
-        merged_events.clear();
+        const bool bucket_events = use_buckets(event_count);
+        if (!bucket_events) {
+            merged_events.clear();
+            merged_events.reserve(event_count);
+        }
         merged_clicks.clear();
-        merged_events.reserve(event_count);
         merged_clicks.reserve(click_count);
         for (auto* fragment = head; fragment != nullptr; fragment = fragment->next) {
-            if (!fragment->events.empty()) {
+            if (!bucket_events && !fragment->events.empty()) {
                 merged_events.insert(merged_events.end(), fragment->events.begin(), fragment->events.end());
             }
             if (!fragment->clicks.empty()) {
                 merged_clicks.insert(merged_clicks.end(), fragment->clicks.begin(), fragment->clicks.end());
             }
         }
-        summarize_timeline(linked_names[ordinal], merged_events, merged_clicks);
+        if (bucket_events) {
+            summarize_buckets(linked_names[ordinal], merged_clicks, [&](const auto& collect) {
+                for (auto* fragment = head; fragment != nullptr; fragment = fragment->next) {
+                    collect(fragment->events);
+                }
+            });
+        } else {
+            summarize_timeline(linked_names[ordinal], merged_events, merged_clicks);
+        }
     }
 }
 
@@ -1171,7 +1326,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         parallel(partitions, threads, [&](size_t lane, size_t part) {
             summarize_person_fragments<TimelineEvent>(
                 *fragments, part, linked.names(part), raw_names, decoded_names[part],
-                lookups, window.start, user_rows[part], campaign_totals[lane]);
+                lookups, window, user_rows[part], campaign_totals[lane]);
         });
     };
     if (CompactTimedEvent::fits(window, lookups.category.size())) {

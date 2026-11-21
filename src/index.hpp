@@ -148,13 +148,6 @@ public:
         : initial_capacity(std::bit_ceil(std::max<size_t>(16, expected + expected / 2))),
           partition_bits(partition_bits) {}
 
-    void prefetch(uint64_t hash) const {
-        if (keys.empty()) return;
-        const size_t first = (hash >> partition_bits) & (keys.size() - 1);
-        __builtin_prefetch(keys.data() + first, 0, 1);
-        __builtin_prefetch(values.get() + first, 0, 1);
-    }
-
     uint64_t find(uint64_t key, uint64_t hash) const {
         if (keys.empty()) return missing;
         const size_t slot = locate(key, hash);

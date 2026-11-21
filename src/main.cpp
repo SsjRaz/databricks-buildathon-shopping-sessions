@@ -7,7 +7,6 @@
 #include <cstdlib>
 #include <deque>
 #include <functional>
-#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -145,6 +144,15 @@ struct ResolvedPerson {
     size_t partition;
 };
 
+ResolvedPerson routed_alias(uint64_t packed) {
+    return {PersonKey::from_packed(packed), shard(packed_alias_hash(packed))};
+}
+
+ResolvedPerson routed_alias(Text name, uint64_t packed, std::vector<Text>& raw_names, size_t lane) {
+    if (packed != nonpacked_id) return routed_alias(packed);
+    return {PersonKey::from_raw(name, raw_names, lane), shard(text_hash(name))};
+}
+
 class LinkedIds {
     struct Node {
         Text name;
@@ -210,35 +218,18 @@ public:
         if (other_ids.empty()) std::vector<size_t>().swap(canonical);
         std::vector<Node>().swap(nodes);
     }
-    void prefetch_person(uint64_t alias) const {
-        if (alias != nonpacked_id && (alias & name_kind_mask) != raw_name_tag) {
-            packed_ids.prefetch(packed_alias_hash(alias));
+    ResolvedPerson person(PersonKey alias, size_t alias_partition, const RawNameLanes& raw_names) const {
+        uint64_t code;
+        if (alias.packed()) {
+            const uint64_t key = alias.packed_key();
+            code = packed_ids.find(key, packed_alias_hash(key));
+            if (code == PackedAliasIndex::missing) return {alias, alias_partition};
+        } else {
+            const Text name = alias.raw_name(raw_names);
+            const uint32_t index = other_ids.find(name, text_hash(name));
+            if (index == StringIndex::missing) return {alias, alias_partition};
+            code = canonical[index];
         }
-    }
-
-    uint64_t prefetch_packed_person(uint64_t packed) const {
-        const uint64_t hash = packed_alias_hash(packed);
-        packed_ids.prefetch(hash);
-        return hash;
-    }
-
-    ResolvedPerson person(uint64_t packed, uint64_t hash) const {
-        const uint64_t code = packed_ids.find(packed, hash);
-        if (code != PackedAliasIndex::missing) return {PersonKey::from_link(code / partitions), shard(code)};
-        return {PersonKey::from_packed(packed), shard(hash)};
-    }
-
-    ResolvedPerson person(uint64_t packed) const {
-        return person(packed, packed_alias_hash(packed));
-    }
-
-    ResolvedPerson person(Text id, uint64_t packed, std::vector<Text>& raw_names, size_t lane) const {
-        if (packed != nonpacked_id) return person(packed);
-
-        const uint64_t hash = text_hash(id);
-        const uint32_t index = other_ids.find(id, hash);
-        if (index == StringIndex::missing) return {PersonKey::from_raw(id, raw_names, lane), shard(hash)};
-        const size_t code = canonical[index];
         return {PersonKey::from_link(code / partitions), shard(code)};
     }
 
@@ -401,13 +392,13 @@ struct Candidate {
 };
 
 struct Event {
-    PersonKey person;
+    PersonKey alias;
     int64_t time;
     uint32_t price, category;
 };
 
 struct Click {
-    PersonKey person;
+    PersonKey alias;
     Text id;
     int64_t time;
     uint32_t campaign;
@@ -443,8 +434,7 @@ CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window win
 // with the remaining bits. A hash match in the byte domain requires equality
 // of the original ID. In the numeric domain the table stores the exact ID.
 template<class Row>
-void deduplicate(std::vector<Shards<Row>>& lanes, size_t part,
-                 Shards<Event>& events, const LinkedIds& linked,
+void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event>& events,
                  std::vector<Text>& raw_names, size_t worker, TimeOrigins origin,
                  const RawNameLanes& raw_candidate_names,
                  std::span<Shards<PackedPurchase>> purchases = {}) {
@@ -507,21 +497,18 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part,
             const auto route = [&](const PackedCandidate& row, uint32_t price, uint32_t category) {
                 const uint64_t alias = row.alias;
                 if (alias == PackedCandidate::invalid_alias) return;
-                const ResolvedPerson person = (alias & name_kind_mask) == raw_name_tag
-                    ? linked.person(candidate_names[alias & name_handle_mask], nonpacked_id, raw_names, worker)
-                    : linked.person(alias);
-                events[person.partition].push_back({person.key, row.event_time(origin), price, category});
+                const auto destination = (alias & name_kind_mask) == raw_name_tag
+                    ? routed_alias(candidate_names[alias & name_handle_mask], nonpacked_id, raw_names, worker)
+                    : routed_alias(alias);
+                events[destination.partition].push_back(
+                    {destination.key, row.event_time(origin), price, category});
             };
 
             // A losing candidate still consumes the extras at its position.
             auto& charges = purchases[lane][part];
             size_t purchase = 0;
             size_t next = charges.empty() ? rows.size() : charges.front().position;
-            constexpr size_t prefetch_distance = 12;
             for (size_t index = 0; index < rows.size(); ++index) {
-                if (index + prefetch_distance < rows.size()) {
-                    linked.prefetch_person(rows[index + prefetch_distance].alias);
-                }
                 if (index == next) {
                     const auto& charge = charges[purchase++];
                     next = purchase == charges.size() ? rows.size() : charges[purchase].position;
@@ -535,32 +522,26 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part,
             for (const Row& row : rows) {
                 const auto& winner = row.payload;
                 if (winner.user.empty()) continue;
-                const ResolvedPerson person =
-                    linked.person(winner.user.text(), pack_parsed_alias(winner.user), raw_names, worker);
-                events[person.partition].push_back({person.key, winner.time, winner.price, winner.category});
+                const auto destination =
+                    routed_alias(winner.user.text(), pack_parsed_alias(winner.user), raw_names, worker);
+                events[destination.partition].push_back(
+                    {destination.key, winner.time, winner.price, winner.category});
             }
         }
         std::vector<Row>().swap(rows);
     }
 }
 
-void read_clicks(Text chunk, Shards<Click>& clicks, const LinkedIds& linked,
-                 const Lookups& lookups, input::Window window,
+void read_clicks(Text chunk, Shards<Click>& clicks, const Lookups& lookups, input::Window window,
                  std::vector<Text>& raw_names, size_t worker) {
     input::read<4>(chunk, [&](const auto& row) {
         if (row[0].empty() || row[1].empty()) return;
-        // Start the packed alias lookup before validating the rest of the
-        // click, and reuse its hash if the click survives.
-        const uint64_t packed = pack_short_id(row[1]);
-        const uint64_t hash = packed != nonpacked_id ? linked.prefetch_packed_person(packed) : 0;
         const int64_t time = input::timestamp(row[3]);
         if (time < window.start - input::week_ms || time >= window.end) return;
         const auto campaign = lookups.campaigns.find(row[2]);
         if (campaign == lookups.campaigns.end()) return;
-        const ResolvedPerson person = packed != nonpacked_id
-            ? linked.person(packed, hash)
-            : linked.person(row[1], nonpacked_id, raw_names, worker);
-        clicks[person.partition].push_back({person.key, row[0], time, campaign->second});
+        const auto destination = routed_alias(row[1], pack_short_id(row[1]), raw_names, worker);
+        clicks[destination.partition].push_back({destination.key, row[0], time, campaign->second});
     });
 }
 
@@ -575,110 +556,115 @@ struct TimedClick {
     uint32_t campaign;
 };
 
-struct PersonGroup {
-    Text name;
+struct AliasGroup {
+    PersonKey alias;
     size_t event_end = 0, click_end = 0;
 };
 
-struct GroupedPartition {
-    std::vector<PersonGroup> people;
+struct AliasStorage {
     std::unique_ptr<TimedEvent[]> events;
     std::unique_ptr<TimedClick[]> clicks;
 };
 
-// Bucket into contiguous per-person ranges, then sort only the timestamps
-// within each range. Clicks for people without surviving events are discarded.
-GroupedPartition group_people(std::vector<Shards<Event>>& event_lanes,
-                              std::vector<Shards<Click>>& click_lanes, size_t part,
-                              std::span<const Text> linked_names, const RawNameLanes& raw_names,
-                              DecodedNames& decoded_names) {
+struct PersonFragment {
+    PersonKey person;
+    std::span<TimedEvent> events;
+    std::span<TimedClick> clicks;
+    PersonFragment* next = nullptr;
+};
+
+using FragmentShards = std::array<std::vector<PersonFragment>, partitions>;
+
+// Gather each raw alias exactly once. Click-only aliases are retained
+// because another alias of their canonical person can have events.
+AliasStorage group_aliases(std::vector<Shards<Event>>& event_lanes,
+                           std::vector<Shards<Click>>& click_lanes, size_t part,
+                           const RawNameLanes& raw_names, const LinkedIds& linked,
+                           FragmentShards& fragments) {
     size_t event_count = 0, click_count = 0;
     for (const auto& lane : event_lanes) event_count += lane[part].size();
     for (const auto& lane : click_lanes) click_count += lane[part].size();
-    GroupedPartition result;
-    if (event_count == 0) return result;
+    AliasStorage storage;
+    if (event_count == 0 && click_count == 0) return storage;
 
-    // The packed hash's low bits are already shared by all names in this
-    // partition. Probe the packed index with the remaining bits.
-    PackedAliasIndex packed_groups(event_count / 32, std::countr_zero(partitions));
-    StringIndex raw_groups(event_count / 256);
-    std::vector<uint32_t> linked_groups(linked_names.size(), StringIndex::missing);
-    std::vector<uint32_t> event_person;
-    std::vector<uint32_t> click_person;
-    event_person.reserve(event_count);
-    click_person.reserve(click_count);
+    // All packed aliases here share the low hash bits used by routing.
+    const size_t row_count = event_count + click_count;
+    PackedAliasIndex packed_groups(row_count / 32, std::countr_zero(partitions));
+    StringIndex raw_groups(row_count / 256);
+    std::vector<AliasGroup> groups;
+    const auto group_for = [&](PersonKey alias) {
+        const auto [id, inserted] = [&] {
+            if (alias.packed()) return packed_groups.try_add(alias.packed_key(), groups.size());
+            const Text name = alias.raw_name(raw_names);
+            return raw_groups.try_add(name, text_hash(name), groups.size());
+        }();
+        if (inserted) groups.push_back({alias});
+        return id;
+    };
+
+    std::vector<uint32_t> event_group, click_group;
+    event_group.reserve(event_count);
+    click_group.reserve(click_count);
     for (const auto& lane : event_lanes) {
         for (const Event& event : lane[part]) {
-            const PersonKey person = event.person;
-            uint32_t id;
-            if (person.linked()) {
-                auto& group = linked_groups[person.ordinal()];
-                if (group == StringIndex::missing) {
-                    group = result.people.size();
-                    result.people.push_back({linked_names[person.ordinal()]});
-                }
-                id = group;
-            } else if (person.packed()) {
-                const auto [group, inserted] = packed_groups.try_add(person.packed_key(), result.people.size());
-                if (inserted) result.people.push_back({decode_name(decoded_names, person.packed_key())});
-                id = group;
-            } else {
-                const Text name = person.raw_name(raw_names);
-                const auto [group, inserted] = raw_groups.try_add(name, text_hash(name), result.people.size());
-                if (inserted) result.people.push_back({name});
-                id = group;
-            }
-            ++result.people[id].event_end;
-            event_person.push_back(id);
+            const uint32_t id = group_for(event.alias);
+            ++groups[id].event_end;
+            event_group.push_back(id);
         }
     }
     for (const auto& lane : click_lanes) {
         for (const Click& click : lane[part]) {
-            const PersonKey person = click.person;
-            uint32_t id;
-            if (person.linked()) {
-                id = linked_groups[person.ordinal()];
-            } else if (person.packed()) {
-                const uint64_t key = person.packed_key();
-                const uint64_t group = packed_groups.find(key, packed_alias_hash(key));
-                id = group == PackedAliasIndex::missing ? StringIndex::missing
-                                                       : static_cast<uint32_t>(group);
-            } else {
-                const Text name = person.raw_name(raw_names);
-                id = raw_groups.find(name, text_hash(name));
-            }
-            if (id != StringIndex::missing) ++result.people[id].click_end;
-            click_person.push_back(id);
+            const uint32_t id = group_for(click.alias);
+            ++groups[id].click_end;
+            click_group.push_back(id);
         }
     }
 
     size_t events = 0, clicks = 0;
-    for (auto& person : result.people) {
-        const size_t person_events = std::exchange(person.event_end, events);
-        const size_t person_clicks = std::exchange(person.click_end, clicks);
-        events += person_events;
-        clicks += person_clicks;
+    for (auto& group : groups) {
+        const size_t group_events = std::exchange(group.event_end, events);
+        const size_t group_clicks = std::exchange(group.click_end, clicks);
+        events += group_events;
+        clicks += group_clicks;
     }
-    result.events = std::make_unique_for_overwrite<TimedEvent[]>(events);
-    if (clicks != 0) result.clicks = std::make_unique_for_overwrite<TimedClick[]>(clicks);
+    if (events != 0) storage.events = std::make_unique_for_overwrite<TimedEvent[]>(events);
+    if (clicks != 0) storage.clicks = std::make_unique_for_overwrite<TimedClick[]>(clicks);
     size_t i = 0;
     for (auto& lane : event_lanes) {
         for (const Event& event : lane[part]) {
-            const size_t offset = result.people[event_person[i++]].event_end++;
-            result.events[offset] = {event.time, event.price, event.category};
+            const size_t offset = groups[event_group[i++]].event_end++;
+            storage.events[offset] = {event.time, event.price, event.category};
         }
         std::vector<Event>().swap(lane[part]);
     }
     i = 0;
     for (auto& lane : click_lanes) {
         for (const Click& click : lane[part]) {
-            const uint32_t id = click_person[i++];
-            if (id == StringIndex::missing) continue;
-            result.clicks[result.people[id].click_end++] = {click.id, click.time, click.campaign};
+            const size_t offset = groups[click_group[i++]].click_end++;
+            storage.clicks[offset] = {click.id, click.time, click.campaign};
         }
         std::vector<Click>().swap(lane[part]);
     }
-    return result;
+
+    size_t event_begin = 0, click_begin = 0;
+    for (const auto& group : groups) {
+        const auto person = linked.person(group.alias, part, raw_names);
+        std::span<TimedEvent> event_span;
+        std::span<TimedClick> click_span;
+        if (event_begin != group.event_end) {
+            event_span = {storage.events.get() + event_begin, group.event_end - event_begin};
+        }
+        if (click_begin != group.click_end) {
+            click_span = {storage.clicks.get() + click_begin, group.click_end - click_begin};
+        }
+        event_begin = group.event_end;
+        click_begin = group.click_end;
+        // An unlinked alias cannot share its clicks with another fragment.
+        if (!event_span.empty() || person.key.linked()) {
+            fragments[person.partition].push_back({person.key, event_span, click_span});
+        }
+    }
+    return storage;
 }
 
 struct UserDay {
@@ -767,8 +753,10 @@ public:
     }
 };
 
-void summarize(GroupedPartition& partition,
-               const Lookups& lookups, std::vector<UserDay>& users, CampaignTotals& campaigns) {
+void summarize_person_fragments(std::array<FragmentShards, partitions>& fragments, size_t part,
+                                std::span<const Text> linked_names, const RawNameLanes& raw_names,
+                                DecodedNames& decoded_names, const Lookups& lookups,
+                                std::vector<UserDay>& users, CampaignTotals& campaigns) {
     Attribution attribution(lookups.campaign.size());
     std::vector<int64_t> category_revenue(lookups.category.size());
     std::vector<uint32_t> purchased_categories;
@@ -786,16 +774,8 @@ void summarize(GroupedPartition& partition,
         users.push_back(daily);
     };
 
-    size_t event_start = 0, click_start = 0;
-    for (const PersonGroup& group : partition.people) {
-        const Text person = group.name;
-        std::span events(partition.events.get() + event_start, group.event_end - event_start);
-        event_start = group.event_end;
-        std::span<TimedClick> clicks;
-        if (click_start != group.click_end) {
-            clicks = {partition.clicks.get() + click_start, group.click_end - click_start};
-            click_start = group.click_end;
-        }
+    const auto summarize_timeline = [&](Text person, std::span<TimedEvent> events, std::span<TimedClick> clicks) {
+        if (events.empty()) return;
         std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
             return a.time < b.time;
         });
@@ -833,6 +813,58 @@ void summarize(GroupedPartition& partition,
             attribution.credit(start, day, revenue, campaigns);
         } while (cursor < events.size());
         finish_day(daily);
+    };
+
+    // Each canonical partition owns its fragments and their row ranges.
+    // Unlinked names occur once by construction; linked ordinals directly
+    // index their fragment chains without a second string lookup.
+    std::vector<PersonFragment*> linked_heads(linked_names.size(), nullptr);
+    for (auto& source : fragments) {
+        for (auto& fragment : source[part]) {
+            const PersonKey person = fragment.person;
+            if (person.linked()) {
+                auto& head = linked_heads[person.ordinal()];
+                fragment.next = head;
+                head = &fragment;
+            } else {
+                const Text name = person.packed() ? decode_name(decoded_names, person.packed_key())
+                                                  : person.raw_name(raw_names);
+                summarize_timeline(name, fragment.events, fragment.clicks);
+            }
+        }
+    }
+
+    std::vector<TimedEvent> merged_events;
+    std::vector<TimedClick> merged_clicks;
+    for (size_t ordinal = 0; ordinal < linked_heads.size(); ++ordinal) {
+        const auto* head = linked_heads[ordinal];
+        if (head == nullptr) continue;
+        if (head->next == nullptr) {
+            summarize_timeline(linked_names[ordinal], head->events, head->clicks);
+            continue;
+        }
+        size_t event_count = 0, click_count = 0;
+        for (auto* fragment = head; fragment != nullptr; fragment = fragment->next) {
+            event_count += fragment->events.size();
+            click_count += fragment->clicks.size();
+        }
+        if (event_count == 0) continue;
+
+        // A multi-alias person needs one contiguous sequence for the
+        // existing comparison sorts. Reuse scratch across these merges.
+        merged_events.clear();
+        merged_clicks.clear();
+        merged_events.reserve(event_count);
+        merged_clicks.reserve(click_count);
+        for (auto* fragment = head; fragment != nullptr; fragment = fragment->next) {
+            if (!fragment->events.empty()) {
+                merged_events.insert(merged_events.end(), fragment->events.begin(), fragment->events.end());
+            }
+            if (!fragment->clicks.empty()) {
+                merged_clicks.insert(merged_clicks.end(), fragment->clicks.begin(), fragment->clicks.end());
+            }
+        }
+        summarize_timeline(linked_names[ordinal], merged_events, merged_clicks);
     }
 }
 
@@ -886,8 +918,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     const auto window = input::parse_window(manifest.bytes());
     const Lookups lookups(products, campaigns);
     timer.mark("lookups");
-    std::promise<LinkedIds> build_links;
-    const auto links_ready = build_links.get_future().share();
+    std::unique_ptr<LinkedIds> linked_ids;
 
     const auto event_chunks = input::chunks(event_files, chunk_size);
     const auto click_chunks = input::chunks(click_files, chunk_size);
@@ -908,19 +939,13 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
 
     parallel(1 + event_chunks.size() + click_chunks.size(), threads, [&](size_t lane, size_t job) {
         if (job == 0) {
-            try {
-                build_links.set_value(LinkedIds(link_files));
-            } catch (...) {
-                build_links.set_exception(std::current_exception());
-                throw;
-            }
+            linked_ids = std::make_unique<LinkedIds>(link_files);
             return;
         }
         --job;
         if (job >= event_chunks.size()) {
-            const auto ready = links_ready;
             read_clicks(click_chunks[job - event_chunks.size()], click_lanes[lane],
-                        ready.get(), lookups, window, raw_names[lane], lane);
+                        lookups, window, raw_names[lane], lane);
             return;
         }
         if (candidate_hint >= 1024 && packed_candidate_lanes[lane][0].capacity() == 0) {
@@ -949,31 +974,40 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         });
     });
     timer.mark("build links and parse events and clicks");
-    const LinkedIds& linked = links_ready.get();
+    const LinkedIds& linked = *linked_ids;
 
     const size_t event_hint = event_bytes / (72 * partitions * threads);
     parallel(partitions, threads, [&](size_t lane, size_t part) {
         if (event_hint >= 1024 && event_lanes[lane][0].capacity() == 0) {
             for (auto& events : event_lanes[lane]) events.reserve(event_hint);
         }
-        deduplicate(packed_candidate_lanes, part, event_lanes[lane], linked, raw_names[lane], lane,
+        deduplicate(packed_candidate_lanes, part, event_lanes[lane], raw_names[lane], lane,
                     time_origin, raw_candidate_names, packed_purchase_lanes);
-        deduplicate(candidate_lanes, part, event_lanes[lane], linked, raw_names[lane], lane,
+        deduplicate(candidate_lanes, part, event_lanes[lane], raw_names[lane], lane,
                     time_origin, raw_candidate_names);
     });
     raw_candidate_names.clear();
     wide_candidate_times.clear();
-    timer.mark("event dedup and routing");
+    timer.mark("event dedup and alias routing");
 
     std::array<DecodedNames, partitions> decoded_names;
     Shards<UserDay> user_rows;
     std::array<CampaignTotals, partitions> campaign_totals;
-    parallel(partitions, threads, [&](size_t, size_t part) {
-        auto grouped = group_people(event_lanes, click_lanes, part, linked.names(part),
-                                    raw_names, decoded_names[part]);
-        summarize(grouped, lookups, user_rows[part], campaign_totals[part]);
-    });
-    timer.mark("sort, sessionize and attribute");
+    {
+        // Fragment spans reference these arrays through the final sort pass.
+        std::array<AliasStorage, partitions> alias_rows;
+        auto fragments = std::make_unique<std::array<FragmentShards, partitions>>();
+        parallel(partitions, threads, [&](size_t, size_t part) {
+            alias_rows[part] = group_aliases(event_lanes, click_lanes, part, raw_names, linked,
+                                            (*fragments)[part]);
+        });
+        timer.mark("group aliases and resolve fragments");
+        parallel(partitions, threads, [&](size_t, size_t part) {
+            summarize_person_fragments(*fragments, part, linked.names(part), raw_names,
+                                       decoded_names[part], lookups, user_rows[part], campaign_totals[part]);
+        });
+    }
+    timer.mark("merge fragments, sort, sessionize and attribute");
 
     CampaignTotals totals;
     for (const auto& part : campaign_totals) {

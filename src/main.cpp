@@ -735,13 +735,27 @@ struct UserDay {
     int64_t sessions = 0, events = 0, revenue = 0;
 };
 
-struct Totals {
-    int64_t sessions = 0, purchasing = 0, revenue = 0, assists = 0;
+struct CreditTotals {
+    int64_t sessions = 0, purchasing = 0, revenue = 0;
 
-    void merge(const Totals& other) {
+    void credit(int64_t amount) {
+        ++sessions;
+        purchasing += amount != 0;
+        revenue += amount;
+    }
+
+    void merge(const CreditTotals& other) {
         sessions += other.sessions;
         purchasing += other.purchasing;
         revenue += other.revenue;
+    }
+};
+
+struct Totals : CreditTotals {
+    int64_t assists = 0;
+
+    void merge(const Totals& other) {
+        CreditTotals::merge(other);
         assists += other.assists;
     }
 };
@@ -752,15 +766,90 @@ struct CampaignDay {
     Totals totals;
 };
 
-using CampaignTotals = std::unordered_map<uint64_t, Totals>;
+using SparseCampaignTotals = std::unordered_map<uint64_t, Totals>;
 
 uint64_t campaign_key(int32_t day, uint32_t campaign) {
     return (static_cast<uint64_t>(static_cast<uint32_t>(day)) << 32) | campaign;
 }
 
-int32_t utc_day(int64_t ms) {
-    return static_cast<int32_t>(ms / input::day_ms - (ms % input::day_ms < 0));
+int64_t utc_day_number(int64_t ms) {
+    return ms / input::day_ms - (ms % input::day_ms < 0);
 }
+
+int32_t utc_day(int64_t ms) {
+    return static_cast<int32_t>(utc_day_number(ms));
+}
+
+struct DayCampaignTotals {
+    CreditTotals* credits = nullptr;
+    int64_t* assists = nullptr;
+    SparseCampaignTotals* sparse = nullptr;
+    uint64_t day_key = 0;
+};
+
+// Workers keep independent totals. Within a small validated day/campaign
+// domain, the assist loop touches only the compact counter array.
+class CampaignTotals {
+    size_t campaign_count;
+    int64_t first_day = 0;
+    std::vector<CreditTotals> credits;
+    std::vector<int64_t> assists;
+    SparseCampaignTotals sparse;
+
+public:
+    CampaignTotals(input::Window window, size_t campaigns) : campaign_count(campaigns) {
+        constexpr size_t max_cells = 65536;
+        const int64_t first = utc_day_number(window.start);
+        const int64_t last = utc_day_number(window.end - 1);
+        const auto days = static_cast<uint64_t>(last - first + 1);
+        if (first >= std::numeric_limits<int32_t>::min() &&
+            last <= std::numeric_limits<int32_t>::max() &&
+            campaign_count != 0 && days <= max_cells / campaign_count) {
+            first_day = first;
+            credits.resize(days * campaign_count);
+            assists.resize(credits.size());
+        }
+    }
+
+    DayCampaignTotals day(int32_t day) {
+        if (credits.empty()) return {nullptr, nullptr, &sparse, campaign_key(day, 0)};
+        const auto offset = static_cast<size_t>(static_cast<int64_t>(day) - first_day) * campaign_count;
+        return {credits.data() + offset, assists.data() + offset};
+    }
+
+    void merge(const CampaignTotals& other) {
+        if (credits.empty()) {
+            for (const auto& [key, value] : other.sparse) sparse[key].merge(value);
+            return;
+        }
+        for (size_t i = 0; i < credits.size(); ++i) {
+            credits[i].merge(other.credits[i]);
+            assists[i] += other.assists[i];
+        }
+    }
+
+    void append_rows(const Lookups& lookups, std::vector<CampaignDay>& rows) const {
+        if (credits.empty()) {
+            rows.reserve(sparse.size());
+            for (const auto& [key, value] : sparse) {
+                const auto campaign = static_cast<uint32_t>(key);
+                const auto day = static_cast<int32_t>(key >> 32);
+                rows.push_back({lookups.campaign[campaign], lookups.channel[campaign], day, value});
+            }
+            return;
+        }
+        rows.reserve(credits.size());
+        for (size_t offset = 0; offset < credits.size(); offset += campaign_count) {
+            const auto day = static_cast<int32_t>(first_day + static_cast<int64_t>(offset / campaign_count));
+            for (size_t campaign = 0; campaign < campaign_count; ++campaign) {
+                const size_t i = offset + campaign;
+                if (credits[i].sessions == 0 && assists[i] == 0) continue;
+                rows.push_back({lookups.campaign[campaign], lookups.channel[campaign], day,
+                                {credits[i], assists[i]}});
+            }
+        }
+    }
+};
 
 class Attribution {
     struct Count { uint32_t count = 0, index = 0; };
@@ -778,7 +867,7 @@ public:
         left = right = latest = 0;
     }
 
-    void credit(int64_t start, int32_t day, int64_t revenue, CampaignTotals& totals) {
+    void credit(int64_t start, int64_t revenue, const DayCampaignTotals& totals) {
         const int64_t oldest = start - input::week_ms;
         while (left < right && clicks[left].time < oldest) {
             auto& slot = counts[clicks[left++].campaign];
@@ -807,11 +896,14 @@ public:
         // Exact duplicate clicks cannot change the winning ID or the set of
         // active campaigns. Their multiplicity expires at the same instant.
         const uint32_t winner = left == right ? 0 : clicks[latest].campaign;
-        auto& credited = totals[campaign_key(day, winner)];
-        ++credited.sessions;
-        credited.purchasing += revenue != 0;
-        credited.revenue += revenue;
-        for (uint32_t campaign : active) ++totals[campaign_key(day, campaign)].assists;
+        if (totals.credits != nullptr) {
+            totals.credits[winner].credit(revenue);
+            for (uint32_t campaign : active) ++totals.assists[campaign];
+        } else {
+            auto& sparse = *totals.sparse;
+            sparse[totals.day_key | winner].credit(revenue);
+            for (uint32_t campaign : active) ++sparse[totals.day_key | campaign].assists;
+        }
     }
 };
 
@@ -851,12 +943,14 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
 
         size_t cursor = 0;
         UserDay daily{person, {}, utc_day(events[cursor].absolute_time(origin))};
+        DayCampaignTotals day_totals = campaigns.day(daily.day);
         do {
             const int64_t start = events[cursor].absolute_time(origin);
             const int32_t day = utc_day(start);
             if (day != daily.day) {
                 finish_day(daily);
                 daily = {person, {}, day};
+                day_totals = campaigns.day(day);
             }
             int64_t previous, revenue = 0;
             const size_t first_event = cursor;
@@ -877,7 +971,7 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
             ++daily.sessions;
             daily.events += cursor - first_event;
             daily.revenue += revenue;
-            attribution.credit(start, day, revenue, campaigns);
+            attribution.credit(start, revenue, day_totals);
         } while (cursor < events.size());
         finish_day(daily);
     };
@@ -1045,7 +1139,11 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
 
     std::array<DecodedNames, partitions> decoded_names;
     Shards<UserDay> user_rows;
-    std::array<CampaignTotals, partitions> campaign_totals;
+    std::vector<CampaignTotals> campaign_totals;
+    campaign_totals.reserve(threads);
+    for (size_t lane = 0; lane < threads; ++lane) {
+        campaign_totals.emplace_back(window, lookups.campaign.size());
+    }
     const auto build_timelines = [&]<class TimelineEvent>() {
         std::vector<Shards<Event<TimelineEvent>>> event_lanes(threads);
         const size_t event_hint = event_bytes / (72 * partitions * threads);
@@ -1070,10 +1168,10 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
                 event_lanes, click_lanes, part, raw_names, linked, (*fragments)[part]);
         });
         timer.mark("group aliases and resolve fragments");
-        parallel(partitions, threads, [&](size_t, size_t part) {
+        parallel(partitions, threads, [&](size_t lane, size_t part) {
             summarize_person_fragments<TimelineEvent>(
                 *fragments, part, linked.names(part), raw_names, decoded_names[part],
-                lookups, window.start, user_rows[part], campaign_totals[part]);
+                lookups, window.start, user_rows[part], campaign_totals[lane]);
         });
     };
     if (CompactTimedEvent::fits(window, lookups.category.size())) {
@@ -1083,17 +1181,12 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     }
     timer.mark("merge fragments, sort, sessionize and attribute");
 
-    CampaignTotals totals;
-    for (const auto& part : campaign_totals) {
-        for (const auto& [key, value] : part) totals[key].merge(value);
+    CampaignTotals& totals = campaign_totals.front();
+    for (size_t lane = 1; lane < campaign_totals.size(); ++lane) {
+        totals.merge(campaign_totals[lane]);
     }
     std::array<std::vector<CampaignDay>, 1> campaign_rows;
-    campaign_rows[0].reserve(totals.size());
-    for (const auto& [key, value] : totals) {
-        const auto campaign = static_cast<uint32_t>(key);
-        const auto day = static_cast<int32_t>(key >> 32);
-        campaign_rows[0].push_back({lookups.campaign[campaign], lookups.channel[campaign], day, value});
-    }
+    totals.append_rows(lookups, campaign_rows[0]);
     // Write a fixed set of parts, including empty parts, so a subsequent run
     // in the same output directory replaces every prior user table part.
     constexpr size_t output_parts = 8;

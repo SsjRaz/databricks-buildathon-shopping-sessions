@@ -391,11 +391,54 @@ struct Candidate {
     CandidatePayload payload;
 };
 
+struct TimedEvent {
+    int64_t timestamp;
+    uint32_t cents, category_id;
+
+    static TimedEvent make(int64_t time, uint32_t price, uint32_t category, int64_t) {
+        return {time, price, category};
+    }
+
+    int64_t clock() const { return timestamp; }
+    int64_t absolute_time(int64_t) const { return timestamp; }
+    int64_t sort_key() const { return timestamp; }
+    uint32_t price() const { return cents; }
+    uint32_t category() const { return category_id; }
+};
+
+// One timeline uses one layout. Compact windows guarantee that every
+// surviving event's offset and category fit, without testing each row.
+// The word carries 32 timestamp bits, 8 category bits and 24 price bits.
+struct CompactTimedEvent {
+    uint64_t word;
+
+    static bool fits(input::Window window, size_t categories) {
+        const uint64_t span = static_cast<uint64_t>(window.end) - static_cast<uint64_t>(window.start);
+        return span <= (uint64_t{1} << 32) && categories <= 256;
+    }
+
+    static CompactTimedEvent make(int64_t time, uint32_t price, uint32_t category, int64_t origin) {
+        // The rule's maximum price is 10,000,000, less than 2^24.
+        const uint64_t offset = static_cast<uint64_t>(time) - static_cast<uint64_t>(origin);
+        return {(offset << 32) | (uint64_t{category} << 24) | price};
+    }
+
+    int64_t clock() const { return static_cast<int64_t>(word >> 32); }
+    int64_t absolute_time(int64_t origin) const { return origin + clock(); }
+    uint64_t sort_key() const { return word; } // Payload bits break irrelevant timestamp ties.
+    uint32_t price() const { return static_cast<uint32_t>(word) & 0xffffff; }
+    uint32_t category() const { return static_cast<uint32_t>(word >> 24) & 0xff; }
+};
+
+template<class TimelineEvent>
 struct Event {
     PersonKey alias;
-    int64_t time;
-    uint32_t price, category;
+    TimelineEvent timed;
 };
+static_assert(sizeof(TimedEvent) == 16);
+static_assert(sizeof(CompactTimedEvent) == 8);
+static_assert(sizeof(Event<TimedEvent>) == 24);
+static_assert(sizeof(Event<CompactTimedEvent>) == 16);
 
 struct TimedClick {
     static constexpr uint32_t wide_id = UINT32_MAX;
@@ -417,7 +460,6 @@ struct Click {
     PersonKey alias;
     TimedClick row;
 };
-static_assert(sizeof(Event) == 24);
 static_assert(sizeof(TimedClick) == 24);
 static_assert(sizeof(Click) == 32);
 
@@ -458,8 +500,8 @@ CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window win
 // each domain candidates in a partition share the low hash bits, so probe
 // with the remaining bits. A hash match in the byte domain requires equality
 // of the original ID. In the numeric domain the table stores the exact ID.
-template<class Row>
-void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event>& events,
+template<class Row, class TimelineEvent>
+void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<TimelineEvent>>& events,
                  std::vector<Text>& raw_names, size_t worker, TimeOrigins origin,
                  const RawNameLanes& raw_candidate_names,
                  std::span<Shards<PackedPurchase>> purchases = {}) {
@@ -525,8 +567,8 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event>& ev
                 const auto destination = (alias & name_kind_mask) == raw_name_tag
                     ? routed_alias(candidate_names[alias & name_handle_mask], nonpacked_id, raw_names, worker)
                     : routed_alias(alias);
-                events[destination.partition].push_back(
-                    {destination.key, row.event_time(origin), price, category});
+                events[destination.partition].push_back({destination.key,
+                    TimelineEvent::make(row.event_time(origin), price, category, origin.event_ms)});
             };
 
             // A losing candidate still consumes the extras at its position.
@@ -549,8 +591,8 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event>& ev
                 if (winner.user.empty()) continue;
                 const auto destination =
                     routed_alias(winner.user.text(), pack_parsed_alias(winner.user), raw_names, worker);
-                events[destination.partition].push_back(
-                    {destination.key, winner.time, winner.price, winner.category});
+                events[destination.partition].push_back({destination.key,
+                    TimelineEvent::make(winner.time, winner.price, winner.category, origin.event_ms)});
             }
         }
         std::vector<Row>().swap(rows);
@@ -571,40 +613,40 @@ void read_clicks(Text chunk, Shards<Click>& clicks, const Lookups& lookups, inpu
     });
 }
 
-struct TimedEvent {
-    int64_t time;
-    uint32_t price, category;
-};
 
 struct AliasGroup {
     PersonKey alias;
     size_t event_end = 0, click_end = 0;
 };
 
+template<class TimelineEvent>
 struct AliasStorage {
-    std::unique_ptr<TimedEvent[]> events;
+    std::unique_ptr<TimelineEvent[]> events;
     std::unique_ptr<TimedClick[]> clicks;
 };
 
+template<class TimelineEvent>
 struct PersonFragment {
     PersonKey person;
-    std::span<TimedEvent> events;
+    std::span<TimelineEvent> events;
     std::span<TimedClick> clicks;
     PersonFragment* next = nullptr;
 };
 
-using FragmentShards = std::array<std::vector<PersonFragment>, partitions>;
+template<class TimelineEvent>
+using FragmentShards = std::array<std::vector<PersonFragment<TimelineEvent>>, partitions>;
 
 // Gather each raw alias exactly once. Click-only aliases are retained
 // because another alias of their canonical person can have events.
-AliasStorage group_aliases(std::vector<Shards<Event>>& event_lanes,
-                           std::vector<Shards<Click>>& click_lanes, size_t part,
-                           const RawNameLanes& raw_names, const LinkedIds& linked,
-                           FragmentShards& fragments) {
+template<class TimelineEvent>
+AliasStorage<TimelineEvent> group_aliases(std::vector<Shards<Event<TimelineEvent>>>& event_lanes,
+                                         std::vector<Shards<Click>>& click_lanes, size_t part,
+                                         const RawNameLanes& raw_names, const LinkedIds& linked,
+                                         FragmentShards<TimelineEvent>& fragments) {
     size_t event_count = 0, click_count = 0;
     for (const auto& lane : event_lanes) event_count += lane[part].size();
     for (const auto& lane : click_lanes) click_count += lane[part].size();
-    AliasStorage storage;
+    AliasStorage<TimelineEvent> storage;
     if (event_count == 0 && click_count == 0) return storage;
 
     // All packed aliases here share the low hash bits used by routing.
@@ -626,7 +668,7 @@ AliasStorage group_aliases(std::vector<Shards<Event>>& event_lanes,
     event_group.reserve(event_count);
     click_group.reserve(click_count);
     for (const auto& lane : event_lanes) {
-        for (const Event& event : lane[part]) {
+        for (const auto& event : lane[part]) {
             const uint32_t id = group_for(event.alias);
             ++groups[id].event_end;
             event_group.push_back(id);
@@ -647,15 +689,15 @@ AliasStorage group_aliases(std::vector<Shards<Event>>& event_lanes,
         events += group_events;
         clicks += group_clicks;
     }
-    if (events != 0) storage.events = std::make_unique_for_overwrite<TimedEvent[]>(events);
+    if (events != 0) storage.events = std::make_unique_for_overwrite<TimelineEvent[]>(events);
     if (clicks != 0) storage.clicks = std::make_unique_for_overwrite<TimedClick[]>(clicks);
     size_t i = 0;
     for (auto& lane : event_lanes) {
-        for (const Event& event : lane[part]) {
+        for (const auto& event : lane[part]) {
             const size_t offset = groups[event_group[i++]].event_end++;
-            storage.events[offset] = {event.time, event.price, event.category};
+            storage.events[offset] = event.timed;
         }
-        std::vector<Event>().swap(lane[part]);
+        std::vector<Event<TimelineEvent>>().swap(lane[part]);
     }
     i = 0;
     for (auto& lane : click_lanes) {
@@ -669,7 +711,7 @@ AliasStorage group_aliases(std::vector<Shards<Event>>& event_lanes,
     size_t event_begin = 0, click_begin = 0;
     for (const auto& group : groups) {
         const auto person = linked.person(group.alias, part, raw_names);
-        std::span<TimedEvent> event_span;
+        std::span<TimelineEvent> event_span;
         std::span<TimedClick> click_span;
         if (event_begin != group.event_end) {
             event_span = {storage.events.get() + event_begin, group.event_end - event_begin};
@@ -773,9 +815,10 @@ public:
     }
 };
 
-void summarize_person_fragments(std::array<FragmentShards, partitions>& fragments, size_t part,
-                                std::span<const Text> linked_names, const RawNameLanes& raw_names,
-                                DecodedNames& decoded_names, const Lookups& lookups,
+template<class TimelineEvent>
+void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partitions>& fragments,
+                                size_t part, std::span<const Text> linked_names, const RawNameLanes& raw_names,
+                                DecodedNames& decoded_names, const Lookups& lookups, int64_t origin,
                                 std::vector<UserDay>& users, CampaignTotals& campaigns) {
     Attribution attribution(lookups.campaign.size());
     std::vector<int64_t> category_revenue(lookups.category.size());
@@ -794,10 +837,10 @@ void summarize_person_fragments(std::array<FragmentShards, partitions>& fragment
         users.push_back(daily);
     };
 
-    const auto summarize_timeline = [&](Text person, std::span<TimedEvent> events, std::span<TimedClick> clicks) {
+    const auto summarize_timeline = [&](Text person, std::span<TimelineEvent> events, std::span<TimedClick> clicks) {
         if (events.empty()) return;
         std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
-            return a.time < b.time;
+            return a.sort_key() < b.sort_key();
         });
         if (clicks.size() > 1) {
             std::sort(clicks.begin(), clicks.end(), [](const auto& a, const auto& b) {
@@ -807,9 +850,9 @@ void summarize_person_fragments(std::array<FragmentShards, partitions>& fragment
         attribution.next_person(clicks);
 
         size_t cursor = 0;
-        UserDay daily{person, {}, utc_day(events[cursor].time)};
+        UserDay daily{person, {}, utc_day(events[cursor].absolute_time(origin))};
         do {
-            const int64_t start = events[cursor].time;
+            const int64_t start = events[cursor].absolute_time(origin);
             const int32_t day = utc_day(start);
             if (day != daily.day) {
                 finish_day(daily);
@@ -818,15 +861,19 @@ void summarize_person_fragments(std::array<FragmentShards, partitions>& fragment
             int64_t previous, revenue = 0;
             const size_t first_event = cursor;
             do {
-                const TimedEvent& event = events[cursor++];
-                previous = event.time;
-                revenue += event.price;
-                if (event.price != 0) {
-                    auto& sum = category_revenue[event.category];
-                    if (sum == 0) purchased_categories.push_back(event.category);
-                    sum += event.price;
+                const auto& event = events[cursor++];
+                previous = event.clock();
+                const uint32_t price = event.price();
+                revenue += price;
+                if (price != 0) {
+                    const uint32_t category = event.category();
+                    auto& sum = category_revenue[category];
+                    if (sum == 0) purchased_categories.push_back(category);
+                    sum += price;
                 }
-            } while (cursor < events.size() && events[cursor].time - previous <= session_gap);
+            } while (cursor < events.size() &&
+                     static_cast<uint64_t>(events[cursor].clock()) - static_cast<uint64_t>(previous) <=
+                         static_cast<uint64_t>(session_gap));
             ++daily.sessions;
             daily.events += cursor - first_event;
             daily.revenue += revenue;
@@ -838,7 +885,7 @@ void summarize_person_fragments(std::array<FragmentShards, partitions>& fragment
     // Each canonical partition owns its fragments and their row ranges.
     // Unlinked names occur once by construction; linked ordinals directly
     // index their fragment chains without a second string lookup.
-    std::vector<PersonFragment*> linked_heads(linked_names.size(), nullptr);
+    std::vector<PersonFragment<TimelineEvent>*> linked_heads(linked_names.size(), nullptr);
     for (auto& source : fragments) {
         for (auto& fragment : source[part]) {
             const PersonKey person = fragment.person;
@@ -854,7 +901,7 @@ void summarize_person_fragments(std::array<FragmentShards, partitions>& fragment
         }
     }
 
-    std::vector<TimedEvent> merged_events;
+    std::vector<TimelineEvent> merged_events;
     std::vector<TimedClick> merged_clicks;
     for (size_t ordinal = 0; ordinal < linked_heads.size(); ++ordinal) {
         const auto* head = linked_heads[ordinal];
@@ -953,7 +1000,6 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     std::vector<Shards<PackedCandidate>> packed_candidate_lanes(threads);
     std::vector<Shards<PackedPurchase>> packed_purchase_lanes(threads);
     std::vector<Shards<Candidate>> candidate_lanes(threads);
-    std::vector<Shards<Event>> event_lanes(threads);
     std::vector<Shards<Click>> click_lanes(threads);
     std::vector<std::deque<Text>> wide_click_ids(threads);
     RawNameLanes raw_names(threads);
@@ -997,36 +1043,43 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     timer.mark("build links and parse events and clicks");
     const LinkedIds& linked = *linked_ids;
 
-    const size_t event_hint = event_bytes / (72 * partitions * threads);
-    parallel(partitions, threads, [&](size_t lane, size_t part) {
-        if (event_hint >= 1024 && event_lanes[lane][0].capacity() == 0) {
-            for (auto& events : event_lanes[lane]) events.reserve(event_hint);
-        }
-        deduplicate(packed_candidate_lanes, part, event_lanes[lane], raw_names[lane], lane,
-                    time_origin, raw_candidate_names, packed_purchase_lanes);
-        deduplicate(candidate_lanes, part, event_lanes[lane], raw_names[lane], lane,
-                    time_origin, raw_candidate_names);
-    });
-    raw_candidate_names.clear();
-    wide_candidate_times.clear();
-    timer.mark("event dedup and alias routing");
-
     std::array<DecodedNames, partitions> decoded_names;
     Shards<UserDay> user_rows;
     std::array<CampaignTotals, partitions> campaign_totals;
-    {
+    const auto build_timelines = [&]<class TimelineEvent>() {
+        std::vector<Shards<Event<TimelineEvent>>> event_lanes(threads);
+        const size_t event_hint = event_bytes / (72 * partitions * threads);
+        parallel(partitions, threads, [&](size_t lane, size_t part) {
+            if (event_hint >= 1024 && event_lanes[lane][0].capacity() == 0) {
+                for (auto& events : event_lanes[lane]) events.reserve(event_hint);
+            }
+            deduplicate(packed_candidate_lanes, part, event_lanes[lane], raw_names[lane], lane,
+                        time_origin, raw_candidate_names, packed_purchase_lanes);
+            deduplicate(candidate_lanes, part, event_lanes[lane], raw_names[lane], lane,
+                        time_origin, raw_candidate_names);
+        });
+        raw_candidate_names.clear();
+        wide_candidate_times.clear();
+        timer.mark("event dedup and alias routing");
+
         // Fragment spans reference these arrays through the final sort pass.
-        std::array<AliasStorage, partitions> alias_rows;
-        auto fragments = std::make_unique<std::array<FragmentShards, partitions>>();
+        std::array<AliasStorage<TimelineEvent>, partitions> alias_rows;
+        auto fragments = std::make_unique<std::array<FragmentShards<TimelineEvent>, partitions>>();
         parallel(partitions, threads, [&](size_t, size_t part) {
-            alias_rows[part] = group_aliases(event_lanes, click_lanes, part, raw_names, linked,
-                                            (*fragments)[part]);
+            alias_rows[part] = group_aliases<TimelineEvent>(
+                event_lanes, click_lanes, part, raw_names, linked, (*fragments)[part]);
         });
         timer.mark("group aliases and resolve fragments");
         parallel(partitions, threads, [&](size_t, size_t part) {
-            summarize_person_fragments(*fragments, part, linked.names(part), raw_names,
-                                       decoded_names[part], lookups, user_rows[part], campaign_totals[part]);
+            summarize_person_fragments<TimelineEvent>(
+                *fragments, part, linked.names(part), raw_names, decoded_names[part],
+                lookups, window.start, user_rows[part], campaign_totals[part]);
         });
+    };
+    if (CompactTimedEvent::fits(window, lookups.category.size())) {
+        build_timelines.operator()<CompactTimedEvent>();
+    } else {
+        build_timelines.operator()<TimedEvent>();
     }
     timer.mark("merge fragments, sort, sessionize and attribute");
 

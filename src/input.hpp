@@ -142,8 +142,8 @@ void read(Text bytes, Fn&& fn) {
     size_t quotes = 0;
     bool malformed = false;
 
-    auto finish_field = [&](const char* last, bool end_of_line) {
-        if (!malformed && (field == Count - 1) == end_of_line) {
+    auto finish_field = [&]<bool EndOfLine, bool EndOfFile = false>(const char* last) {
+        if (!malformed && (field == Count - 1) == EndOfLine) {
             if (quotes == 0) {
                 record[field] = Text(first, last - first);
             } else if (quotes == 2 && *first == '"' && last[-1] == '"') {
@@ -154,14 +154,14 @@ void read(Text bytes, Fn&& fn) {
         } else {
             malformed = true;
         }
-        if (end_of_line) {
+        if constexpr (EndOfLine) {
             if (!malformed) fn(record);
             field = 0;
             malformed = false;
         } else {
             ++field;
         }
-        first = last == end ? end : last + 1;
+        if constexpr (!EndOfFile) first = last + 1;
         quotes = 0;
     };
 
@@ -178,7 +178,8 @@ void read(Text bytes, Fn&& fn) {
             const uint32_t earlier = bit - 1;
             quotes += std::popcount(quote_bits & earlier);
             quote_bits &= ~earlier;
-            finish_field(position + offset, (newlines & bit) != 0);
+            if (newlines & bit) finish_field.template operator()<true>(position + offset);
+            else finish_field.template operator()<false>(position + offset);
         }
         quotes += std::popcount(quote_bits);
     };
@@ -192,7 +193,7 @@ void read(Text bytes, Fn&& fn) {
         std::memcpy(tail, block, end - block);
         scan(block, _mm256_load_si256(reinterpret_cast<const __m256i*>(tail)));
     }
-    if (first != end || field != 0) finish_field(end, true);
+    if (first != end || field != 0) finish_field.template operator()<true, true>(end);
 #else
     lines(bytes, [&](Text line) {
         if (fields(line, record)) fn(record);

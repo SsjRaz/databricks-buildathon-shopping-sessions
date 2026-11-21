@@ -1,4 +1,5 @@
 #include "input.hpp"
+#include "index.hpp"
 #include "parquet.hpp"
 
 #include <atomic>
@@ -6,6 +7,7 @@
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <thread>
@@ -15,14 +17,13 @@ namespace {
 using input::Text;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
-constexpr size_t partitions = 64;
+constexpr size_t partitions = 128;
 constexpr size_t chunk_size = 4 * 1024 * 1024;
 constexpr int64_t session_gap = 1800000;
 
 template<class Row>
 using Shards = std::array<std::vector<Row>, partitions>;
 
-uint64_t hash(Text value) { return std::hash<Text>{}(value); }
 size_t shard(uint64_t value) { return value & (partitions - 1); }
 
 template<class Fn>
@@ -49,70 +50,66 @@ void parallel(size_t jobs, size_t threads, Fn&& fn) {
     if (error) std::rethrow_exception(error);
 }
 
-template<class Row>
-std::vector<Row> gather(std::vector<Shards<Row>>& lanes, size_t partition) {
-    size_t count = 0;
-    std::vector<Row>* largest = &lanes.front()[partition];
-    for (auto& lane : lanes) {
-        auto& rows = lane[partition];
-        count += rows.size();
-        if (rows.size() > largest->size()) largest = &rows;
-    }
-    std::vector<Row> combined;
-    if (largest->size() == count) {
-        combined.swap(*largest);
-    } else {
-        combined.reserve(count);
-        for (auto& lane : lanes) {
-            auto& rows = lane[partition];
-            combined.insert(combined.end(), rows.begin(), rows.end());
-            std::vector<Row>().swap(rows);
-        }
-    }
-    return combined;
-}
+struct Person {
+    Text name;
+    uint64_t hash;
+};
 
 class LinkedIds {
     struct Node {
-        size_t parent, size;
-        Text name;
+        Person person;
+        uint32_t parent, size;
     };
     std::vector<Node> nodes;
-    std::unordered_map<Text, size_t> ids;
+    StringIndex ids;
 
-    size_t index(Text id) {
-        const auto [it, inserted] = ids.try_emplace(id, nodes.size());
-        if (inserted) nodes.push_back({it->second, 1, id});
-        return it->second;
+    uint32_t index(Text id) {
+        const uint64_t hash = text_hash(id);
+        const auto [i, inserted] = ids.try_add(id, hash, nodes.size());
+        if (inserted) nodes.push_back({{id, hash}, i, 1});
+        return i;
     }
-    size_t root(size_t i) {
+    uint32_t root(uint32_t i) {
         while (nodes[i].parent != i) {
             i = nodes[i].parent = nodes[nodes[i].parent].parent;
         }
         return i;
     }
     void join(Text a, Text b) {
-        size_t first = root(index(a));
-        size_t second = root(index(b));
+        uint32_t first = root(index(a));
+        uint32_t second = root(index(b));
         if (first == second) return;
         if (nodes[first].size < nodes[second].size) std::swap(first, second);
         nodes[second].parent = first;
         nodes[first].size += nodes[second].size;
-        nodes[first].name = std::min(nodes[first].name, nodes[second].name);
+        if (nodes[second].person.name < nodes[first].person.name) {
+            nodes[first].person = nodes[second].person;
+        }
+    }
+
+    static size_t estimate_ids(const std::vector<input::Mapping>& links) {
+        size_t bytes = 0;
+        for (const auto& file : links) bytes += file.bytes().size();
+        // Reserve a starting capacity, with normal growth for different ID
+        // lengths and link shapes. Cap the estimate for unusually long rows.
+        return std::min<size_t>(bytes / 16, 4 * 1024 * 1024);
     }
 
 public:
-    explicit LinkedIds(const std::vector<input::Mapping>& links) {
+    explicit LinkedIds(const std::vector<input::Mapping>& links) : ids(estimate_ids(links)) {
+        nodes.reserve(estimate_ids(links));
         for (const auto& file : links) {
             input::lookup<2>(file, [&](const auto& row) {
                 if (!row[0].empty() && !row[1].empty()) join(row[0], row[1]);
             });
         }
-        for (auto& [id, i] : ids) i = root(i);
+        for (uint32_t i = 0; i < nodes.size(); ++i) nodes[i].parent = root(i);
+        for (Node& node : nodes) node.person = nodes[node.parent].person;
     }
-    Text person(Text id) const {
-        const auto it = ids.find(id);
-        return it == ids.end() ? id : nodes[it->second].name;
+    Person person(Text id) const {
+        const uint64_t hash = text_hash(id);
+        const uint32_t index = ids.find(id, hash);
+        return index == StringIndex::missing ? Person{id, hash} : nodes[index].person;
     }
 };
 
@@ -167,10 +164,12 @@ struct Click {
 
 Candidate event_candidate(const std::array<Text, 7>& row, input::Window window,
                           const Lookups& lookups) {
-    Candidate candidate{hash(row[0]), row[0], {}, 0, input::iso_time(row[3])};
+    Candidate candidate{text_hash(row[0]), row[0], {}, 0, input::iso_time(row[3])};
     if (row[1].empty() || row[5].empty()) return candidate;
     const int64_t time = input::timestamp(row[2]);
-    if (time < window.start || time >= window.end || candidate.ingest - time > input::day_ms) {
+    if (time < window.start || time >= window.end ||
+        (candidate.ingest > time && static_cast<uint64_t>(candidate.ingest) -
+             static_cast<uint64_t>(time) > input::day_ms)) {
         return candidate;
     }
     if (row[4] == "purchase") {
@@ -186,22 +185,51 @@ Candidate event_candidate(const std::array<Text, 7>& row, input::Window window,
     return candidate;
 }
 
-bool candidate_less(const Candidate& a, const Candidate& b) {
-    if (a.id_hash != b.id_hash) return a.id_hash < b.id_hash;
-    const int id = a.id.compare(b.id);
-    return id == 0 ? a.ingest < b.ingest : id < 0;
-}
+// Candidates in a partition all share the low hash bits. Use the
+// remaining bits for linear probing, and compare IDs on hash matches.
+void deduplicate(std::vector<Shards<Candidate>>& lanes, size_t part,
+                 Shards<Event>& events, const LinkedIds& linked) {
+    size_t count = 0;
+    for (const auto& lane : lanes) count += lane[part].size();
+    if (count == 0) return;
 
-bool event_less(const Event& a, const Event& b) {
-    const int person = a.person.compare(b.person);
-    return person == 0 ? a.time < b.time : person < 0;
-}
+    struct Entry { Candidate* winner = nullptr; uint64_t hash = 0; };
+    const size_t capacity = std::bit_ceil(count + count / 3 + 1);
+    const size_t mask = capacity - 1;
+    std::vector<Entry> table(capacity);
+    for (auto& lane : lanes) {
+        for (Candidate& candidate : lane[part]) {
+            size_t slot = (candidate.id_hash / partitions) & mask;
+            while (true) {
+                Entry& entry = table[slot];
+                if (!entry.winner) {
+                    entry = {&candidate, candidate.id_hash};
+                    break;
+                }
+                if (entry.hash == candidate.id_hash && entry.winner->id == candidate.id) {
+                    if (candidate.ingest < entry.winner->ingest) {
+                        entry.winner->user = {};
+                        entry.winner = &candidate;
+                    } else {
+                        candidate.user = {};
+                    }
+                    break;
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+    }
 
-bool click_less(const Click& a, const Click& b) {
-    const int person = a.person.compare(b.person);
-    if (person != 0) return person < 0;
-    if (a.time != b.time) return a.time < b.time;
-    return a.id < b.id;
+    // Walk the original buffers in input order instead of gathering and
+    // sorting candidates or fetching the winners in hash-table order.
+    for (auto& lane : lanes) {
+        for (const Candidate& winner : lane[part]) {
+            if (winner.user.empty()) continue;
+            const Person person = linked.person(winner.user);
+            events[shard(person.hash)].push_back({person.name, winner.time, winner.price, winner.category});
+        }
+        std::vector<Candidate>().swap(lane[part]);
+    }
 }
 
 void read_clicks(Text chunk, Shards<Click>& clicks, const LinkedIds& linked,
@@ -212,9 +240,92 @@ void read_clicks(Text chunk, Shards<Click>& clicks, const LinkedIds& linked,
         if (time < window.start - input::week_ms || time >= window.end) return;
         const auto campaign = lookups.campaigns.find(row[2]);
         if (campaign == lookups.campaigns.end()) return;
-        const Text person = linked.person(row[1]);
-        clicks[shard(hash(person))].push_back({person, row[0], time, campaign->second});
+        const Person person = linked.person(row[1]);
+        clicks[shard(person.hash)].push_back({person.name, row[0], time, campaign->second});
     });
+}
+
+struct TimedEvent {
+    int64_t time;
+    uint32_t price, category;
+};
+
+struct TimedClick {
+    Text id;
+    int64_t time;
+    uint32_t campaign;
+};
+
+struct PersonGroup {
+    Text name;
+    size_t event_end = 0, click_end = 0;
+};
+
+struct GroupedPartition {
+    std::vector<PersonGroup> people;
+    std::unique_ptr<TimedEvent[]> events;
+    std::unique_ptr<TimedClick[]> clicks;
+};
+
+// Bucket into contiguous per-person ranges, then sort only the timestamps
+// within each range. Clicks for people without surviving events are discarded.
+GroupedPartition group_people(std::vector<Shards<Event>>& event_lanes,
+                              std::vector<Shards<Click>>& click_lanes, size_t part) {
+    size_t event_count = 0, click_count = 0;
+    for (const auto& lane : event_lanes) event_count += lane[part].size();
+    for (const auto& lane : click_lanes) click_count += lane[part].size();
+    GroupedPartition result;
+    if (event_count == 0) return result;
+
+    StringIndex index(event_count / 16);
+    std::vector<uint32_t> event_person;
+    std::vector<uint32_t> click_person;
+    event_person.reserve(event_count);
+    click_person.reserve(click_count);
+    for (const auto& lane : event_lanes) {
+        for (const Event& event : lane[part]) {
+            const auto [id, inserted] =
+                index.try_add(event.person, text_hash(event.person), result.people.size());
+            if (inserted) result.people.push_back({event.person});
+            ++result.people[id].event_end;
+            event_person.push_back(id);
+        }
+    }
+    for (const auto& lane : click_lanes) {
+        for (const Click& click : lane[part]) {
+            const uint32_t id = index.find(click.person, text_hash(click.person));
+            if (id != StringIndex::missing) ++result.people[id].click_end;
+            click_person.push_back(id);
+        }
+    }
+
+    size_t events = 0, clicks = 0;
+    for (auto& person : result.people) {
+        const size_t person_events = std::exchange(person.event_end, events);
+        const size_t person_clicks = std::exchange(person.click_end, clicks);
+        events += person_events;
+        clicks += person_clicks;
+    }
+    result.events = std::make_unique_for_overwrite<TimedEvent[]>(events);
+    if (clicks != 0) result.clicks = std::make_unique_for_overwrite<TimedClick[]>(clicks);
+    size_t i = 0;
+    for (auto& lane : event_lanes) {
+        for (const Event& event : lane[part]) {
+            const size_t offset = result.people[event_person[i++]].event_end++;
+            result.events[offset] = {event.time, event.price, event.category};
+        }
+        std::vector<Event>().swap(lane[part]);
+    }
+    i = 0;
+    for (auto& lane : click_lanes) {
+        for (const Click& click : lane[part]) {
+            const uint32_t id = click_person[i++];
+            if (id == StringIndex::missing) continue;
+            result.clicks[result.people[id].click_end++] = {click.id, click.time, click.campaign};
+        }
+        std::vector<Click>().swap(lane[part]);
+    }
+    return result;
 }
 
 struct UserDay {
@@ -254,12 +365,12 @@ class Attribution {
     struct Count { uint32_t count = 0, index = 0; };
     std::vector<Count> counts;
     std::vector<uint32_t> active;
-    std::span<const Click> clicks;
+    std::span<const TimedClick> clicks;
     size_t left = 0, right = 0, latest = 0;
 
 public:
     explicit Attribution(size_t campaigns) : counts(campaigns) {}
-    void next_person(std::span<const Click> person_clicks) {
+    void next_person(std::span<const TimedClick> person_clicks) {
         for (uint32_t campaign : active) counts[campaign].count = 0;
         active.clear();
         clicks = person_clicks;
@@ -281,7 +392,7 @@ public:
             left = right;
         }
         while (right < clicks.size() && clicks[right].time <= start) {
-            const Click& click = clicks[right];
+            const TimedClick& click = clicks[right];
             // Click IDs are ascending within a timestamp, so only the first
             // click at that timestamp can win credit.
             if (right == left || click.time != clicks[right - 1].time) latest = right;
@@ -303,7 +414,7 @@ public:
     }
 };
 
-void summarize(std::span<const Event> events, std::span<const Click> clicks,
+void summarize(GroupedPartition& partition,
                const Lookups& lookups, std::vector<UserDay>& users, CampaignTotals& campaigns) {
     Attribution attribution(lookups.campaign.size());
     std::vector<int64_t> category_revenue(lookups.category.size());
@@ -322,15 +433,27 @@ void summarize(std::span<const Event> events, std::span<const Click> clicks,
         users.push_back(daily);
     };
 
-    size_t cursor = 0;
-    size_t click_cursor = 0;
-    while (cursor < events.size()) {
-        const Text person = events[cursor].person;
-        while (click_cursor < clicks.size() && clicks[click_cursor].person < person) ++click_cursor;
-        const size_t first = click_cursor;
-        while (click_cursor < clicks.size() && clicks[click_cursor].person == person) ++click_cursor;
-        attribution.next_person(clicks.subspan(first, click_cursor - first));
+    size_t event_start = 0, click_start = 0;
+    for (const PersonGroup& group : partition.people) {
+        const Text person = group.name;
+        std::span events(partition.events.get() + event_start, group.event_end - event_start);
+        event_start = group.event_end;
+        std::span<TimedClick> clicks;
+        if (click_start != group.click_end) {
+            clicks = {partition.clicks.get() + click_start, group.click_end - click_start};
+            click_start = group.click_end;
+        }
+        std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
+            return a.time < b.time;
+        });
+        if (clicks.size() > 1) {
+            std::sort(clicks.begin(), clicks.end(), [](const auto& a, const auto& b) {
+                return a.time != b.time ? a.time < b.time : a.id < b.id;
+            });
+        }
+        attribution.next_person(clicks);
 
+        size_t cursor = 0;
         UserDay daily{person, {}, utc_day(events[cursor].time)};
         do {
             const int64_t start = events[cursor].time;
@@ -342,7 +465,7 @@ void summarize(std::span<const Event> events, std::span<const Click> clicks,
             int64_t previous, revenue = 0;
             const size_t first_event = cursor;
             do {
-                const Event& event = events[cursor++];
+                const TimedEvent& event = events[cursor++];
                 previous = event.time;
                 revenue += event.price;
                 if (event.price != 0) {
@@ -350,13 +473,12 @@ void summarize(std::span<const Event> events, std::span<const Click> clicks,
                     if (sum == 0) purchased_categories.push_back(event.category);
                     sum += event.price;
                 }
-            } while (cursor < events.size() && events[cursor].time - previous <= session_gap &&
-                     events[cursor].person == person);
+            } while (cursor < events.size() && events[cursor].time - previous <= session_gap);
             ++daily.sessions;
             daily.events += cursor - first_event;
             daily.revenue += revenue;
             attribution.credit(start, day, revenue, campaigns);
-        } while (cursor < events.size() && events[cursor].person == person);
+        } while (cursor < events.size());
         finish_day(daily);
     }
 }
@@ -415,6 +537,11 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
 
     const auto event_chunks = input::chunks(event_files, chunk_size);
     const auto click_chunks = input::chunks(click_files, chunk_size);
+    size_t event_bytes = 0;
+    for (Text chunk : event_chunks) event_bytes += chunk.size();
+    // A capacity hint only. Vectors still grow normally for smaller rows or
+    // uneven work distribution.
+    const size_t candidate_hint = event_bytes / (64 * partitions * threads);
     std::vector<Shards<Candidate>> candidate_lanes(threads);
     std::vector<Shards<Event>> event_lanes(threads);
     std::vector<Shards<Click>> click_lanes(threads);
@@ -423,6 +550,9 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         if (job >= event_chunks.size()) {
             read_clicks(click_chunks[job - event_chunks.size()], click_lanes[lane], linked, lookups, window);
             return;
+        }
+        if (candidate_hint >= 1024 && candidate_lanes[lane][0].capacity() == 0) {
+            for (auto& candidates : candidate_lanes[lane]) candidates.reserve(candidate_hint);
         }
         input::read<7>(event_chunks[job], [&](const auto& row) {
             if (row[0].empty()) return;
@@ -433,30 +563,15 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     timer.mark("parse events and clicks");
 
     parallel(partitions, threads, [&](size_t lane, size_t part) {
-        auto candidates = gather(candidate_lanes, part);
-        std::sort(candidates.begin(), candidates.end(), candidate_less);
-        for (size_t i = 0; i < candidates.size();) {
-            const Candidate& winner = candidates[i++];
-            if (!winner.user.empty()) {
-                const Text person = linked.person(winner.user);
-                event_lanes[lane][shard(hash(person))].push_back(
-                    {person, winner.time, winner.price, winner.category});
-            }
-            while (i < candidates.size() && winner.id_hash == candidates[i].id_hash &&
-                   winner.id == candidates[i].id) ++i;
-        }
+        deduplicate(candidate_lanes, part, event_lanes[lane], linked);
     });
     timer.mark("event dedup and routing");
 
     Shards<UserDay> user_rows;
     std::array<CampaignTotals, partitions> campaign_totals;
     parallel(partitions, threads, [&](size_t, size_t part) {
-        auto events = gather(event_lanes, part);
-        if (events.empty()) return;
-        auto clicks = gather(click_lanes, part);
-        std::sort(events.begin(), events.end(), event_less);
-        std::sort(clicks.begin(), clicks.end(), click_less);
-        summarize(events, clicks, lookups, user_rows[part], campaign_totals[part]);
+        auto grouped = group_people(event_lanes, click_lanes, part);
+        summarize(grouped, lookups, user_rows[part], campaign_totals[part]);
     });
     timer.mark("sort, sessionize and attribute");
 

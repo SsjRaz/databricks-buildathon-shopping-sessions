@@ -2,11 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #include <limits>
 #include <string_view>
 #include <system_error>
@@ -129,9 +133,71 @@ bool fields(Text line, std::array<Text, Count>& out) {
 template<size_t Count, class Fn>
 void read(Text bytes, Fn&& fn) {
     std::array<Text, Count> record;
+#ifdef __AVX2__
+    if (bytes.empty()) return;
+    const char* block = bytes.data();
+    const char* end = block + bytes.size();
+    const char* first = block;
+    size_t field = 0;
+    size_t quotes = 0;
+    bool malformed = false;
+
+    auto finish_field = [&](const char* last, bool end_of_line) {
+        if (!malformed && (field == Count - 1) == end_of_line) {
+            if (quotes == 0) {
+                record[field] = Text(first, last - first);
+            } else if (quotes == 2 && *first == '"' && last[-1] == '"') {
+                record[field] = Text(first + 1, last - first - 2);
+            } else {
+                malformed = true;
+            }
+        } else {
+            malformed = true;
+        }
+        if (end_of_line) {
+            if (!malformed) fn(record);
+            field = 0;
+            malformed = false;
+        } else {
+            ++field;
+        }
+        first = last == end ? end : last + 1;
+        quotes = 0;
+    };
+
+    const auto comma = _mm256_set1_epi8(',');
+    const auto newline = _mm256_set1_epi8('\n');
+    const auto quote = _mm256_set1_epi8('"');
+    auto scan = [&](const char* position, __m256i values) {
+        const auto commas = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(values, comma)));
+        const auto newlines = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(values, newline)));
+        auto quote_bits = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(values, quote)));
+        for (uint32_t separators = commas | newlines; separators != 0; separators &= separators - 1) {
+            const unsigned offset = std::countr_zero(separators);
+            const uint32_t bit = uint32_t{1} << offset;
+            const uint32_t earlier = bit - 1;
+            quotes += std::popcount(quote_bits & earlier);
+            quote_bits &= ~earlier;
+            finish_field(position + offset, (newlines & bit) != 0);
+        }
+        quotes += std::popcount(quote_bits);
+    };
+
+    while (end - block >= 32) {
+        scan(block, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block)));
+        block += 32;
+    }
+    if (block != end) {
+        alignas(32) char tail[32]{};
+        std::memcpy(tail, block, end - block);
+        scan(block, _mm256_load_si256(reinterpret_cast<const __m256i*>(tail)));
+    }
+    if (first != end || field != 0) finish_field(end, true);
+#else
     lines(bytes, [&](Text line) {
         if (fields(line, record)) fn(record);
     });
+#endif
 }
 
 template<size_t Count, class Fn>
@@ -162,27 +228,57 @@ inline int days_since_epoch(int year, unsigned month, unsigned day) {
            (153 * m + 2) / 5 + day - 1) - 719468;
 }
 
+inline constexpr int32_t invalid_day = std::numeric_limits<int32_t>::min();
+
+inline int32_t calendar_day(const char* p) {
+    struct Entry {
+        uint64_t prefix = 0;
+        uint16_t suffix = 0;
+        int32_t days = invalid_day;
+    };
+    thread_local std::array<Entry, 64> cache;
+    uint64_t prefix;
+    uint16_t suffix;
+    std::memcpy(&prefix, p, sizeof(prefix));
+    std::memcpy(&suffix, p + sizeof(prefix), sizeof(suffix));
+
+    // Index by the day of the month for the common case where most rows are
+    // from one short window. Compare all ten date bytes before reusing a day.
+    const unsigned slot = ((p[8] & 15) * 10 + (p[9] & 15)) & (cache.size() - 1);
+    auto& entry = cache[slot];
+    if (entry.prefix == prefix && entry.suffix == suffix) return entry.days;
+
+    int32_t result = invalid_day;
+    if (p[4] == '-' && p[7] == '-') {
+        const int century = pair(p);
+        const int year_suffix = pair(p + 2);
+        const int month = pair(p + 5);
+        const int day = pair(p + 8);
+        if (century >= 0 && year_suffix >= 0 && month >= 1 && month <= 12 && day >= 1) {
+            const int year = century * 100 + year_suffix;
+            constexpr int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+            if (day <= month_days[month - 1] + (month == 2 && leap(year))) {
+                result = days_since_epoch(year, month, day);
+            }
+        }
+    }
+    entry = {prefix, suffix, result};
+    return result;
+}
+
 inline int64_t iso_time(Text text) {
     const bool zulu = text.size() == 20;
     if (!zulu && text.size() != 25) return invalid_time;
     const char* p = text.data();
-    if (p[4] != '-' || p[7] != '-' || p[10] != 'T' || p[13] != ':' || p[16] != ':') {
-        return invalid_time;
-    }
-    const int century = pair(p);
-    const int year_suffix = pair(p + 2);
-    const int month = pair(p + 5);
-    const int day = pair(p + 8);
+    if (p[10] != 'T' || p[13] != ':' || p[16] != ':') return invalid_time;
+    const int32_t day = calendar_day(p);
     const int hour = pair(p + 11);
     const int minute = pair(p + 14);
     const int second = pair(p + 17);
-    if (century < 0 || year_suffix < 0 || month < 1 || month > 12 || day < 1 ||
-        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+    if (day == invalid_day || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+        second < 0 || second > 59) {
         return invalid_time;
     }
-    const int year = century * 100 + year_suffix;
-    constexpr int days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    if (day > days[month - 1] + (month == 2 && leap(year))) return invalid_time;
     int offset = 0;
     if (zulu) {
         if (p[19] != 'Z') return invalid_time;
@@ -193,8 +289,7 @@ inline int64_t iso_time(Text text) {
         if (h < 0 || h > 23 || m < 0 || m > 59) return invalid_time;
         offset = (h * 60 + m) * (p[19] == '-' ? -1 : 1);
     }
-    return days_since_epoch(year, month, day) * day_ms +
-           ((hour * 60 + minute - offset) * 60 + second) * int64_t{1000};
+    return day * day_ms + ((hour * 60 + minute - offset) * 60 + second) * int64_t{1000};
 }
 
 inline uint64_t decimal(Text text, uint64_t limit) {
@@ -210,7 +305,28 @@ inline uint64_t decimal(Text text, uint64_t limit) {
     return result;
 }
 
+// Check eight ASCII bytes at once, then combine adjacent decimal groups.
+inline uint32_t eight_digits(const char* p) {
+    uint64_t bytes;
+    std::memcpy(&bytes, p, sizeof(bytes));
+    constexpr uint64_t high = 0xf0f0f0f0f0f0f0f0ULL;
+    constexpr uint64_t ascii = 0x3030303030303030ULL;
+    if ((bytes & high) != ascii || ((bytes + 0x0606060606060606ULL) & high) != ascii) {
+        return UINT32_MAX;
+    }
+    bytes &= ~high;
+    bytes = (bytes * 10 + (bytes >> 8)) & 0x00ff00ff00ff00ffULL;
+    bytes = (bytes * 100 + (bytes >> 16)) & 0x0000ffff0000ffffULL;
+    return static_cast<uint32_t>(bytes * 10000 + (bytes >> 32));
+}
+
 inline int64_t timestamp(Text text) {
+    if (text.size() == 13) {
+        const uint32_t first = eight_digits(text.data());
+        const uint32_t last = eight_digits(text.data() + 5);
+        if (first == UINT32_MAX || last == UINT32_MAX) return invalid_time;
+        return int64_t{first} * 100000 + last % 100000;
+    }
     if ((text.size() == 20 || text.size() == 25) && text[4] == '-') return iso_time(text);
     const uint64_t value = decimal(text, INT64_MAX);
     return value == UINT64_MAX ? invalid_time : static_cast<int64_t>(value);

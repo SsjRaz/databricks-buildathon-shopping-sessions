@@ -402,17 +402,16 @@ struct PackedCandidate {
 };
 static_assert(sizeof(PackedCandidate) == 24);
 
-uint64_t pack_candidate_times(const CandidatePayload& payload, TimeOrigins origin,
+uint64_t pack_candidate_times(const CandidatePayload& payload, int64_t ingest_seconds, TimeOrigins origin,
                               std::deque<WideCandidateTimes>& overflow) {
     // Invalid events still enter dedup with their original ingest. Their
     // event time is never consumed because their user is empty.
     const uint64_t event_delta = payload.user.empty() ? 0 :
         static_cast<uint64_t>(payload.time) - static_cast<uint64_t>(origin.event_ms);
-    const int64_t ingest_delta = payload.ingest / 1000 - origin.ingest_seconds;
-
-    if (event_delta <= UINT32_MAX && payload.ingest % 1000 == 0 &&
-        ingest_delta >= -PackedCandidate::ingest_bias && ingest_delta < PackedCandidate::ingest_bias) {
-        const auto biased = static_cast<uint64_t>(ingest_delta + PackedCandidate::ingest_bias);
+    const uint64_t biased = static_cast<uint64_t>(ingest_seconds) -
+        static_cast<uint64_t>(origin.ingest_seconds) + PackedCandidate::ingest_bias;
+    if (event_delta <= UINT32_MAX && ingest_seconds != input::invalid_time &&
+        biased < 2 * PackedCandidate::ingest_bias) {
         return (biased << 32) | event_delta;
     }
 
@@ -531,16 +530,49 @@ TimedClick make_timed_click(Text id, int64_t time, uint32_t campaign, std::deque
     return {{.full = &wide_ids.back()}, time, campaign, TimedClick::wide_id};
 }
 
+struct EventIngest {
+    int64_t seconds, milliseconds;
+};
+
+EventIngest decode_event_ingest(Text text) {
+    if (text.size() != 20) {
+        const int64_t ms = input::iso_time(text);
+        return {ms == input::invalid_time ? input::invalid_time : ms / 1000, ms};
+    }
+    // The rules guarantee valid whole-second UTC for ingest_ts. Event and
+    // click timestamps still use the validating parser for all three forms.
+    const char* p = text.data();
+    const int32_t day = input::calendar_day(p);
+    if (day == input::invalid_day) return {input::invalid_time, input::invalid_time};
+    const auto two = [](const char* digits) { return 10 * (digits[0] - '0') + digits[1] - '0'; };
+    const int64_t seconds = int64_t{day} * 86400 + 3600 * two(p + 11) + 60 * two(p + 14) + two(p + 17);
+    return {seconds, seconds * 1000};
+}
+
+bool valid_event_time(int64_t time, int64_t ingest, input::Window window) {
+    return time >= window.start && time < window.end &&
+        !(ingest > time && static_cast<uint64_t>(ingest) - static_cast<uint64_t>(time) > input::day_ms);
+}
+
+// CSV structure, view/cart type and the nonempty product have already been
+// verified. Invalid clocks/users still compete on the original ingest time.
+CandidatePayload nonpurchase_payload(Text user, Text event, int64_t ingest_ms, input::Window window) {
+    CandidatePayload candidate{{}, 0, ingest_ms};
+    if (user.empty()) return candidate;
+    const int64_t time = input::timestamp(event);
+    if (valid_event_time(time, candidate.ingest, window)) {
+        candidate.user = ParsedAlias(user);
+        candidate.time = time;
+    }
+    return candidate;
+}
+
 CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window window,
-                               const Lookups& lookups) {
-    CandidatePayload candidate{{}, 0, input::iso_time(row[3])};
+                               const Lookups& lookups, int64_t ingest_ms) {
+    CandidatePayload candidate{{}, 0, ingest_ms};
     if (row[1].empty() || row[5].empty()) return candidate;
     const int64_t time = input::timestamp(row[2]);
-    if (time < window.start || time >= window.end ||
-        (candidate.ingest > time && static_cast<uint64_t>(candidate.ingest) -
-             static_cast<uint64_t>(time) > input::day_ms)) {
-        return candidate;
-    }
+    if (!valid_event_time(time, candidate.ingest, window)) return candidate;
     if (row[4] == "purchase") {
         const uint64_t price = input::decimal(row[6], 10000000);
         if (price == 0 || price == UINT64_MAX) return candidate;
@@ -1325,26 +1357,33 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         if (candidate_hint >= 1024 && packed_candidate_lanes[lane][0].capacity() == 0) {
             for (auto& candidates : packed_candidate_lanes[lane]) candidates.reserve(candidate_hint);
         }
-        input::read_events(event_chunks[job], [&](const auto& row) {
-            const Text id = row[0];
-            if (id.empty()) return;
-
+        const auto emit = [&]<bool may_purchase>(Text id, const CandidatePayload& payload, int64_t ingest_seconds) {
             const uint64_t packed = pack_short_id(id);
-            const auto payload = event_payload(row, window, lookups);
             if (packed != nonpacked_id) {
                 const size_t part = shard(packed_alias_hash(packed));
                 auto& candidates = packed_candidate_lanes[lane][part];
-                if (payload.price != 0) {
-                    packed_purchase_lanes[lane][part].push_back(
-                        {candidates.size(), payload.price, payload.category});
+                if constexpr (may_purchase) {
+                    if (payload.price != 0) {
+                        packed_purchase_lanes[lane][part].push_back(
+                            {candidates.size(), payload.price, payload.category});
+                    }
                 }
-                const uint64_t times = pack_candidate_times(payload, time_origin, wide_candidate_times[lane]);
+                const uint64_t times = pack_candidate_times(payload, ingest_seconds, time_origin, wide_candidate_times[lane]);
                 const uint64_t alias = pack_candidate_alias(payload.user, raw_candidate_names[lane]);
                 candidates.push_back({packed, alias, times});
             } else {
                 const uint64_t hash = text_hash(id);
                 candidate_lanes[lane][shard(hash)].push_back({hash, id, payload});
             }
+        };
+        input::read_events(event_chunks[job], [&](const auto& row) {
+            if (row[0].empty()) return;
+            const EventIngest ingest = decode_event_ingest(row[3]);
+            emit.template operator()<true>(row[0], event_payload(row, window, lookups, ingest.milliseconds), ingest.seconds);
+        }, [&](Text id, Text user, Text event, Text ingest) {
+            if (id.empty()) return;
+            const EventIngest clock = decode_event_ingest(ingest);
+            emit.template operator()<false>(id, nonpurchase_payload(user, event, clock.milliseconds, window), clock.seconds);
         });
     });
     timer.mark("build links and parse events and clicks");

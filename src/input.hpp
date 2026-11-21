@@ -16,6 +16,7 @@
 #include <system_error>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <type_traits>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -222,9 +223,9 @@ inline uint64_t low_bits(unsigned length) {
 // A seven-field shape with two short IDs followed by a timestamp has three
 // separators in disjoint bands, including independent quotes around any field.
 // Six total commas and three trailing commas certify all inferred positions.
-template<class Fn>
+template<class Fn, class Nonpurchase>
 bool shaped_event_row(const char* row, unsigned length, uint64_t commas, uint64_t tail_commas,
-                      uint64_t quotes, uint64_t tail_quotes, Fn& fn) {
+                      uint64_t quotes, uint64_t tail_quotes, Fn& fn, Nonpurchase& nonpurchase) {
     const uint64_t first = commas & (uint64_t{0xf} << 8);
     const uint64_t second = commas & (uint64_t{0x7f} << 17);
     const uint64_t third = commas & (uint64_t{0x1fffff} << 31);
@@ -238,16 +239,18 @@ bool shaped_event_row(const char* row, unsigned length, uint64_t commas, uint64_
         const uint64_t tail_ends = tail_commas | (length >= 64 ? uint64_t{1} << (length - 64) : 0);
         const uint64_t starts = (commas << 1) | 1;
         const uint64_t tail_starts = (tail_commas << 1) | (commas >> 63);
-        const uint64_t closes = (ends >> 1) | (tail_ends << 63);
-        const uint64_t tail_closes = tail_ends >> 1;
-        if ((quotes & ~(starts | closes)) || (tail_quotes & ~(tail_starts | tail_closes))) return true;
-        const auto field_bits = [&](uint64_t lo, uint64_t hi) -> unsigned {
-            return static_cast<unsigned>(_pext_u64(quotes, lo) |
-                (_pext_u64(tail_quotes, hi) << std::popcount(lo)));
-        };
-        trim = field_bits(starts, tail_starts);
-        if (trim != field_bits(closes, tail_closes) ||
-            std::popcount(quotes) + std::popcount(tail_quotes) != 2 * std::popcount(trim)) return true;
+        // The delimiter bits are zero in ~boundaries. Adding each field's
+        // opening quote to these runs of ones carries to its own delimiter
+        // and stops. Every other quote must be immediately before exactly
+        // those delimiters. A one-byte quote supplies no distinct closer.
+        using Bits = unsigned __int128;
+        const Bits boundaries = (Bits{tail_ends} << 64) | ends;
+        const Bits openings = (Bits{tail_quotes & tail_starts} << 64) | (quotes & starts);
+        const Bits all_quotes = (Bits{tail_quotes} << 64) | quotes;
+        if (((all_quotes ^ openings) << 1) != ((~boundaries + openings) & boundaries)) return true;
+        trim = static_cast<unsigned>(_pext_u64(quotes, starts) |
+            (_pext_u64(tail_quotes, tail_starts) << std::popcount(starts)));
+
     }
 
     const unsigned c0 = std::countr_zero(first);
@@ -262,6 +265,20 @@ bool shaped_event_row(const char* row, unsigned length, uint64_t commas, uint64_
         const unsigned q = (trim >> i) & 1;
         return Text(row + begin + q, end - begin - 2*q);
     };
+    if constexpr (!std::is_same_v<std::remove_cvref_t<Nonpurchase>, std::nullptr_t>) {
+        const unsigned kind_trim = (trim >> 4) & 1;
+        const unsigned product_trim = (trim >> 5) & 1;
+        if (c4 - c3 == 5 + 2*kind_trim && c5 - c4 > 1 + 2*product_trim) {
+            const char* kind = row + c3 + 1 + kind_trim;
+            if (std::memcmp(kind, "view", 4) == 0 || std::memcmp(kind, "cart", 4) == 0) {
+                // The whole row is structurally valid and the product exists
+                // as a nonempty field. Price and product bytes are immaterial.
+                nonpurchase(slice(0, 0, c0), slice(1, c0+1, c1),
+                            slice(2, c1+1, c2), slice(3, c2+1, c3));
+                return true;
+            }
+        }
+    }
     const std::array<Text, 7> record{{
         slice(0, 0, c0), slice(1, c0+1, c1), slice(2, c1+1, c2),
         slice(3, c2+1, c3), slice(4, c3+1, c4), slice(5, c4+1, c5), slice(6, c5+1, length)
@@ -271,8 +288,8 @@ bool shaped_event_row(const char* row, unsigned length, uint64_t commas, uint64_
 }
 #endif
 
-template<class Fn>
-void read_events(Text bytes, Fn&& fn) {
+template<class Fn, class Nonpurchase = std::nullptr_t>
+void read_events(Text bytes, Fn&& fn, Nonpurchase&& nonpurchase = nullptr) {
 #if defined(__AVX2__) && defined(__BMI2__)
     while (bytes.size() >= 96) {
         const char* row = bytes.data();
@@ -289,7 +306,7 @@ void read_events(Text bytes, Fn&& fn) {
                 return first | (uint64_t{second} << 32);
             };
             if (shaped_event_row(row, n, join(a.comma, b.comma) & low, c.comma & high,
-                                 join(a.quote, b.quote) & low, c.quote & high, fn)) {
+                                 join(a.quote, b.quote) & low, c.quote & high, fn, nonpurchase)) {
                 bytes.remove_prefix(n+1);
                 continue;
             }

@@ -120,11 +120,12 @@ private:
 
     std::vector<Slot> slots;
     size_t initial_capacity;
+    unsigned partition_bits;
     size_t used = 0;
 
     size_t locate(uint64_t key, uint64_t hash) const {
         const size_t mask = slots.size() - 1;
-        size_t i = hash & mask;
+        size_t i = (hash >> partition_bits) & mask;
         while (slots[i].value != missing && slots[i].key != key) i = (i + 1) & mask;
         return i;
     }
@@ -138,8 +139,9 @@ private:
     }
 
 public:
-    explicit PackedAliasIndex(size_t expected)
-        : initial_capacity(std::bit_ceil(std::max<size_t>(16, expected + expected / 2))) {}
+    explicit PackedAliasIndex(size_t expected, unsigned partition_bits = 0)
+        : initial_capacity(std::bit_ceil(std::max<size_t>(16, expected + expected / 2))),
+          partition_bits(partition_bits) {}
 
     uint64_t find(uint64_t key, uint64_t hash) const {
         if (slots.empty()) return missing;

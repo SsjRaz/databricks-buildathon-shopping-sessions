@@ -52,16 +52,19 @@ void parallel(size_t jobs, size_t threads, Fn&& fn) {
     if (error) std::rethrow_exception(error);
 }
 
-// A linked person has a stable ordinal within their output partition.
-// Unlinked IDs keep a view of their original bytes for exact comparison.
+// Linked people use an ordinal. Unlinked people keep the original
+// name pointer and either an exact ASCII code or a tagged byte length.
 struct PersonKey {
     const char* bytes;
-    size_t length_or_ordinal;
+    uint64_t value;
 
     bool linked() const { return bytes == nullptr; }
-    size_t ordinal() const { return length_or_ordinal; }
-    Text unlinked_name() const { return {bytes, length_or_ordinal}; }
+    bool packed() const { return bytes != nullptr && (value & nonpacked_alias) == 0; }
+    uint64_t packed_key() const { return value; }
+    size_t ordinal() const { return value; }
+    Text unlinked_name() const { return {bytes, packed() ? 9 : value & ~nonpacked_alias}; }
 };
+static_assert(sizeof(PersonKey) == sizeof(Text));
 
 struct ResolvedPerson {
     PersonKey key;
@@ -138,11 +141,11 @@ public:
             const uint64_t hash = packed_alias_hash(packed);
             const uint64_t code = packed_ids.find(packed, hash);
             if (code != PackedAliasIndex::missing) return {{nullptr, code / partitions}, shard(code)};
-            return {{id.data(), id.size()}, shard(hash)};
+            return {{id.data(), packed}, shard(hash)};
         }
         const uint64_t hash = text_hash(id);
         const uint32_t index = other_ids.find(id, hash);
-        if (index == StringIndex::missing) return {{id.data(), id.size()}, shard(hash)};
+        if (index == StringIndex::missing) return {{id.data(), nonpacked_alias | id.size()}, shard(hash)};
         const size_t code = canonical[index];
         return {{nullptr, code / partitions}, shard(code)};
     }
@@ -390,7 +393,10 @@ GroupedPartition group_people(std::vector<Shards<Event>>& event_lanes,
     GroupedPartition result;
     if (event_count == 0) return result;
 
-    StringIndex index(event_count / 32);
+    // The packed hash's low bits are already shared by all names in this
+    // partition. Probe the packed index with the remaining bits.
+    PackedAliasIndex packed_groups(event_count / 32, std::countr_zero(partitions));
+    StringIndex raw_groups(event_count / 256);
     std::vector<uint32_t> linked_groups(linked_names.size(), StringIndex::missing);
     std::vector<uint32_t> event_person;
     std::vector<uint32_t> click_person;
@@ -407,9 +413,13 @@ GroupedPartition group_people(std::vector<Shards<Event>>& event_lanes,
                     result.people.push_back({linked_names[person.ordinal()]});
                 }
                 id = group;
+            } else if (person.packed()) {
+                const auto [group, inserted] = packed_groups.try_add(person.packed_key(), result.people.size());
+                if (inserted) result.people.push_back({person.unlinked_name()});
+                id = group;
             } else {
                 const Text name = person.unlinked_name();
-                const auto [group, inserted] = index.try_add(name, text_hash(name), result.people.size());
+                const auto [group, inserted] = raw_groups.try_add(name, text_hash(name), result.people.size());
                 if (inserted) result.people.push_back({name});
                 id = group;
             }
@@ -420,8 +430,18 @@ GroupedPartition group_people(std::vector<Shards<Event>>& event_lanes,
     for (const auto& lane : click_lanes) {
         for (const Click& click : lane[part]) {
             const PersonKey person = click.person;
-            const uint32_t id = person.linked() ? linked_groups[person.ordinal()]
-                : index.find(person.unlinked_name(), text_hash(person.unlinked_name()));
+            uint32_t id;
+            if (person.linked()) {
+                id = linked_groups[person.ordinal()];
+            } else if (person.packed()) {
+                const uint64_t key = person.packed_key();
+                const uint64_t group = packed_groups.find(key, packed_alias_hash(key));
+                id = group == PackedAliasIndex::missing ? StringIndex::missing
+                                                       : static_cast<uint32_t>(group);
+            } else {
+                const Text name = person.unlinked_name();
+                id = raw_groups.find(name, text_hash(name));
+            }
             if (id != StringIndex::missing) ++result.people[id].click_end;
             click_person.push_back(id);
         }

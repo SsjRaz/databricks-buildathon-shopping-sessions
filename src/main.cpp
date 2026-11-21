@@ -498,19 +498,40 @@ static_assert(sizeof(CompactTimedEvent) == 8);
 static_assert(sizeof(Event<TimedEvent>) == 24);
 static_assert(sizeof(Event<CompactTimedEvent>) == 16);
 
-struct TimedClick {
-    static constexpr uint32_t wide_id = UINT32_MAX;
-
-    union {
-        const char* bytes;
-        const Text* full;
-    } id;
-    int64_t time;
+struct WideClickId {
+    Text id;
     uint32_t campaign;
-    uint32_t length;
+};
+
+// Time stays directly sortable over the whole signed range. The second word
+// holds a checked 48-bit mapped byte address, a short ID length, and a local
+// campaign ordinal. Other IDs and table sizes use the exact side record.
+struct TimedClick {
+    static constexpr uint64_t wide = uint64_t{1} << 63;
+    static constexpr uint64_t address_mask = (uint64_t{1} << 48) - 1;
+    static constexpr unsigned campaign_shift = 51;
+    static constexpr unsigned min_length = 5;
+    static constexpr unsigned length_mask = 7;
+    static constexpr unsigned campaign_limit = 1 << (63 - campaign_shift);
+
+    int64_t time;
+    uint64_t identity;
+
+    const WideClickId& full() const {
+        const auto address = static_cast<uintptr_t>((identity & ~wide) << 1);
+        return *reinterpret_cast<const WideClickId*>(address);
+    }
 
     Text id_text() const {
-        return length == wide_id ? *id.full : Text(id.bytes, length);
+        if (identity & wide) return full().id;
+        const auto address = static_cast<uintptr_t>(identity & address_mask);
+        const size_t length = min_length + ((identity >> 48) & length_mask);
+        return {reinterpret_cast<const char*>(address), length};
+    }
+
+    uint32_t campaign() const {
+        if (identity & wide) return full().campaign;
+        return static_cast<uint32_t>(identity >> campaign_shift);
     }
 };
 
@@ -518,17 +539,87 @@ struct Click {
     PersonKey alias;
     TimedClick row;
 };
-static_assert(sizeof(TimedClick) == 24);
-static_assert(sizeof(Click) == 32);
+static_assert(sizeof(TimedClick) == 16);
+static_assert(sizeof(Click) == 24);
 
-TimedClick make_timed_click(Text id, int64_t time, uint32_t campaign, std::deque<Text>& wide_ids) {
-    if (id.size() < TimedClick::wide_id) {
-        return {{.bytes = id.data()}, time, campaign, static_cast<uint32_t>(id.size())};
+// The parser appends to one lane. The two grouping passes read each shard's
+// blocks in identical order. No live clicks move as other shards grow.
+class ClickLane {
+    static constexpr size_t block_rows = 128;
+    static constexpr size_t max_slab_blocks = 32;
+
+    struct Shard {
+        std::vector<Click*> blocks;
+        Click* cursor = nullptr;
+        Click* end = nullptr;
+    };
+    struct FreeSlab {
+        size_t rows;
+        void operator()(Click* base) const noexcept {
+            std::allocator<Click>{}.deallocate(base, rows);
+        }
+    };
+    using Slab = std::unique_ptr<Click, FreeSlab>;
+    static_assert(std::is_trivially_destructible_v<Click>);
+
+    std::array<Shard, partitions> shards;
+    std::vector<Slab> slabs;
+    Click* next_block = nullptr;
+    size_t available = 0, next_slab_size = 1;
+
+    Click* acquire_block() {
+        if (available == 0) {
+            const size_t rows = next_slab_size * block_rows;
+            Slab slab(std::allocator<Click>{}.allocate(rows), FreeSlab{rows});
+            next_block = slab.get();
+            slabs.push_back(std::move(slab));
+            available = next_slab_size;
+            next_slab_size = std::min(next_slab_size * 4, max_slab_blocks);
+        }
+        --available;
+        return std::exchange(next_block, next_block + block_rows);
     }
-    // The source mapping owns the bytes. The deque keeps the full-width
-    // Text view stable while its parsing lane appends more IDs.
-    wide_ids.push_back(id);
-    return {{.full = &wide_ids.back()}, time, campaign, TimedClick::wide_id};
+public:
+    void append(size_t part, Click click) {
+        auto& dst = shards[part];
+        if (dst.cursor == dst.end) {
+            Click* block = acquire_block();
+            dst.blocks.push_back(block);
+            dst.cursor = block;
+            dst.end = block + block_rows;
+        }
+        std::construct_at(dst.cursor++, click);
+    }
+
+    size_t size(size_t part) const {
+        const auto& src = shards[part];
+        if (src.blocks.empty()) return 0;
+        return (src.blocks.size() - 1) * block_rows + (src.cursor - src.blocks.back());
+    }
+
+    template<class Fn>
+    void visit(size_t part, Fn&& fn) const {
+        const auto& src = shards[part];
+        if (src.blocks.empty()) return;
+        const Click* tail = src.blocks.back();
+        for (size_t i = 0; i + 1 < src.blocks.size(); ++i) {
+            fn(std::span<const Click>(src.blocks[i], block_rows));
+        }
+        fn(std::span<const Click>(tail, src.cursor));
+    }
+};
+
+TimedClick make_timed_click(Text id, int64_t time, uint32_t campaign, std::deque<WideClickId>& wide_ids) {
+    const auto address = reinterpret_cast<uintptr_t>(id.data());
+    const size_t length = id.size() - TimedClick::min_length;
+    if ((address & ~TimedClick::address_mask) == 0 && length <= TimedClick::length_mask &&
+        campaign < TimedClick::campaign_limit) {
+        return {time, (uint64_t{campaign} << TimedClick::campaign_shift) | (length << 48) | address};
+    }
+    wide_ids.push_back({id, campaign});
+    static_assert(alignof(WideClickId) >= 2);
+    const auto side = reinterpret_cast<uintptr_t>(&wide_ids.back());
+    return {time, TimedClick::wide | (static_cast<uint64_t>(side) >> 1)};
 }
 
 CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window window,
@@ -657,8 +748,8 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<Time
     }
 }
 
-void read_clicks(Text chunk, Shards<Click>& clicks, const Lookups& lookups, input::Window window,
-                 std::vector<Text>& raw_names, size_t worker, std::deque<Text>& wide_ids) {
+void read_clicks(Text chunk, ClickLane& clicks, const Lookups& lookups, input::Window window,
+                 std::vector<Text>& raw_names, size_t worker, std::deque<WideClickId>& wide_ids) {
     input::read<4>(chunk, [&](const auto& row) {
         if (row[0].empty() || row[1].empty()) return;
         const int64_t time = input::timestamp(row[3]);
@@ -667,7 +758,7 @@ void read_clicks(Text chunk, Shards<Click>& clicks, const Lookups& lookups, inpu
         if (campaign == lookups.campaigns.end()) return;
         const auto destination = routed_alias(row[1], pack_short_id(row[1]), raw_names, worker);
         const TimedClick click = make_timed_click(row[0], time, campaign->second, wide_ids);
-        clicks[destination.partition].push_back({destination.key, click});
+        clicks.append(destination.partition, {destination.key, click});
     });
 }
 
@@ -698,12 +789,12 @@ using FragmentShards = std::array<std::vector<PersonFragment<TimelineEvent>>, pa
 // because another alias of their canonical person can have events.
 template<class TimelineEvent>
 AliasStorage<TimelineEvent> group_aliases(std::vector<Shards<Event<TimelineEvent>>>& event_lanes,
-                                         std::vector<Shards<Click>>& click_lanes, size_t part,
+                                         const std::vector<ClickLane>& click_lanes, size_t part,
                                          const RawNameLanes& raw_names, const LinkedIds& linked,
                                          FragmentShards<TimelineEvent>& fragments) {
     size_t event_count = 0, click_count = 0;
     for (const auto& lane : event_lanes) event_count += lane[part].size();
-    for (const auto& lane : click_lanes) click_count += lane[part].size();
+    for (const auto& lane : click_lanes) click_count += lane.size(part);
     AliasStorage<TimelineEvent> storage;
     if (event_count == 0 && click_count == 0) return storage;
 
@@ -733,11 +824,13 @@ AliasStorage<TimelineEvent> group_aliases(std::vector<Shards<Event<TimelineEvent
         }
     }
     for (const auto& lane : click_lanes) {
-        for (const Click& click : lane[part]) {
-            const uint32_t id = group_for(click.alias);
-            ++groups[id].click_end;
-            click_group.push_back(id);
-        }
+        lane.visit(part, [&](std::span<const Click> block) {
+            for (const Click& click : block) {
+                const uint32_t id = group_for(click.alias);
+                ++groups[id].click_end;
+                click_group.push_back(id);
+            }
+        });
     }
 
     size_t events = 0, clicks = 0;
@@ -758,12 +851,13 @@ AliasStorage<TimelineEvent> group_aliases(std::vector<Shards<Event<TimelineEvent
         std::vector<Event<TimelineEvent>>().swap(lane[part]);
     }
     i = 0;
-    for (auto& lane : click_lanes) {
-        for (const Click& click : lane[part]) {
-            const size_t offset = groups[click_group[i++]].click_end++;
-            storage.clicks[offset] = click.row;
-        }
-        std::vector<Click>().swap(lane[part]);
+    for (const auto& lane : click_lanes) {
+        lane.visit(part, [&](std::span<const Click> block) {
+            for (const Click& click : block) {
+                const size_t offset = groups[click_group[i++]].click_end++;
+                storage.clicks[offset] = click.row;
+            }
+        });
     }
 
     size_t event_begin = 0, click_begin = 0;
@@ -949,19 +1043,19 @@ public:
                 (click.time == winner->time && click.id_text() < winner->id_text())) {
                 winner = &click;
             }
-            auto& count = counts[click.campaign].count;
+            auto& count = counts[click.campaign()].count;
             if (count == 0) {
                 count = 1;
-                active.push_back(click.campaign);
+                active.push_back(click.campaign());
             }
         }
-        record(winner == nullptr ? 0 : winner->campaign, revenue, totals);
+        record(winner == nullptr ? 0 : winner->campaign(), revenue, totals);
     }
 
     void credit(int64_t start, int64_t revenue, const DayCampaignTotals& totals) {
         const int64_t oldest = start - input::week_ms;
         while (left < right && clicks[left].time < oldest) {
-            auto& slot = counts[clicks[left++].campaign];
+            auto& slot = counts[clicks[left++].campaign()];
             if (--slot.count == 0) {
                 counts[active.back()].index = slot.index;
                 active[slot.index] = active.back();
@@ -977,16 +1071,16 @@ public:
             // Click IDs are ascending within a timestamp, so only the first
             // click at that timestamp can win credit.
             if (right == left || click.time != clicks[right - 1].time) latest = right;
-            auto& slot = counts[click.campaign];
+            auto& slot = counts[click.campaign()];
             if (slot.count++ == 0) {
                 slot.index = active.size();
-                active.push_back(click.campaign);
+                active.push_back(click.campaign());
             }
             ++right;
         }
         // Exact duplicate clicks cannot change the winning ID or the set of
         // active campaigns. Their multiplicity expires at the same instant.
-        const uint32_t winner = left == right ? 0 : clicks[latest].campaign;
+        const uint32_t winner = left == right ? 0 : clicks[latest].campaign();
         record(winner, revenue, totals);
     }
 };
@@ -1307,8 +1401,8 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     std::vector<Shards<PackedCandidate>> packed_candidate_lanes(threads);
     std::vector<Shards<PackedPurchase>> packed_purchase_lanes(threads);
     std::vector<Shards<Candidate>> candidate_lanes(threads);
-    std::vector<Shards<Click>> click_lanes(threads);
-    std::vector<std::deque<Text>> wide_click_ids(threads);
+    std::vector<ClickLane> click_lanes(threads);
+    std::vector<std::deque<WideClickId>> wide_click_ids(threads);
     RawNameLanes raw_names(threads);
 
     parallel(1 + event_chunks.size() + click_chunks.size(), threads, [&](size_t lane, size_t job) {
@@ -1380,6 +1474,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
             alias_rows[part] = group_aliases<TimelineEvent>(
                 event_lanes, click_lanes, part, raw_names, linked, (*fragments)[part]);
         });
+        click_lanes.clear();
         timer.mark("group aliases and resolve fragments");
         parallel(partitions, threads, [&](size_t lane, size_t part) {
             summarize_person_fragments<TimelineEvent>(

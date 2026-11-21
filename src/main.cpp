@@ -53,44 +53,92 @@ void parallel(size_t jobs, size_t threads, Fn&& fn) {
     if (error) std::rethrow_exception(error);
 }
 
-// Packed names use all 63 low bits without a tag. Linked person ordinals
-// and coordinates in the raw-name store have distinct high-bit tags.
-constexpr uint64_t raw_name = uint64_t{3} << 62;
-struct TimedEvent {
-    int64_t time;
-    uint32_t price, category;
-};
+// Nine bytes occupy the low 63 bits. Eight-byte codes set the high bit
+// and use only the low 56 bits. Use a separate miss code, since eight NUL
+// bytes are represented by the high bit alone.
+constexpr uint64_t packed_eight_tag = uint64_t{1} << 63;
+constexpr uint64_t nonpacked_id = UINT64_MAX;
+constexpr uint64_t name_kind_mask = uint64_t{7} << 61;
+constexpr uint64_t linked_name_tag = uint64_t{5} << 61;
+constexpr uint64_t raw_name_tag = uint64_t{6} << 61;
+constexpr uint64_t name_handle_mask = ~name_kind_mask;
 
-struct LaneExtras {
-    size_t lane;
-    std::vector<Text> names;
-    std::vector<TimedEvent> details;
-
-    uint64_t routed_time(int64_t time, uint32_t price, uint32_t category) {
-        if (price == 0 && time >= 0) return static_cast<uint64_t>(time);
-        const size_t index = details.size();
-        details.push_back({time, price, category});
-        return nonpacked_alias | (index * partitions + lane);
+uint64_t pack_short_id(Text id) {
+    if (id.size() == 9) {
+        const uint64_t key = pack_alias(id);
+        return key == nonpacked_alias ? nonpacked_id : key;
     }
-    // The low partition bits identify the producing worker (threads <= partitions).
-    uint64_t add_name(Text id) {
-        const size_t index = names.size();
-        names.push_back(id);
-        return raw_name | (index * partitions + lane);
-    }
-};
+    if (id.size() != 8) return nonpacked_id;
 
-struct PersonKey {
+    constexpr uint64_t byte_mask = 0x7f7f7f7f7f7f7f7fULL;
+    uint64_t bytes;
+    std::memcpy(&bytes, id.data(), sizeof(bytes));
+    if (bytes & ~byte_mask) return nonpacked_id;
+#if defined(__BMI2__)
+    return packed_eight_tag | _pext_u64(bytes, byte_mask);
+#else
+    uint64_t key = packed_eight_tag;
+    for (size_t i = 0; i < id.size(); ++i) {
+        key |= uint64_t{static_cast<unsigned char>(id[i])} << (7 * i);
+    }
+    return key;
+#endif
+}
+
+using RawNameLanes = std::vector<std::vector<Text>>;
+using DecodedNames = std::deque<std::array<char, 9>>;
+
+// Both packed name ranges sort below the linked and raw handle ranges.
+class PersonKey {
     uint64_t value;
-    bool linked() const { return (value >> 62) == 2; }
-    bool packed() const { return (value & nonpacked_alias) == 0; }
+
+    explicit PersonKey(uint64_t value) : value(value) {}
+
+public:
+    static PersonKey from_link(size_t ordinal) {
+        // Linked graph nodes are indexed by uint32_t, so every ordinal fits.
+        return PersonKey(linked_name_tag | ordinal);
+    }
+
+    static PersonKey from_packed(uint64_t name) { return PersonKey(name); }
+
+    static PersonKey from_raw(Text name, std::vector<Text>& names, size_t lane) {
+        if (names.size() > name_handle_mask / partitions) {
+            throw std::overflow_error("too many raw person names");
+        }
+        const uint64_t handle = names.size() * partitions + lane;
+        names.push_back(name);
+        return PersonKey(raw_name_tag | handle);
+    }
+
+    bool linked() const { return (value & name_kind_mask) == linked_name_tag; }
+    bool packed() const { return value < linked_name_tag; }
     uint64_t packed_key() const { return value; }
-    size_t ordinal() const { return value & ~nonpacked_alias; }
-    Text unlinked_name(std::span<const LaneExtras> store) const {
-        const uint64_t location = value & ~raw_name;
-        return store[shard(location)].names[location / partitions];
+    size_t ordinal() const { return value & name_handle_mask; }
+
+    Text raw_name(const RawNameLanes& names) const {
+        const uint64_t handle = value & name_handle_mask;
+        return names[shard(handle)][handle / partitions];
     }
 };
+static_assert(sizeof(PersonKey) == sizeof(uint64_t));
+
+Text decode_name(DecodedNames& names, uint64_t key) {
+    // User rows keep a view into this arena through Parquet writing.
+    auto& bytes = names.emplace_back();
+    const size_t length = (key & packed_eight_tag) != 0 ? 8 : 9;
+#if defined(__BMI2__)
+    constexpr uint64_t byte_mask = 0x7f7f7f7f7f7f7f7fULL;
+    const uint64_t first_eight = _pdep_u64(key, byte_mask);
+    std::memcpy(bytes.data(), &first_eight, sizeof(first_eight));
+    if (length == 9) bytes[8] = static_cast<char>(key >> 56);
+#else
+    for (size_t i = 0; i < length; ++i) {
+        bytes[i] = static_cast<char>((key >> (7 * i)) & 0x7f);
+    }
+#endif
+    return Text(bytes.data(), length);
+}
 
 struct ResolvedPerson {
     PersonKey key;
@@ -109,8 +157,8 @@ class LinkedIds {
     std::array<std::vector<Text>, partitions> names_by_partition;
 
     uint32_t index(Text id) {
-        const uint64_t packed = pack_alias(id);
-        const auto [i, inserted] = packed == nonpacked_alias
+        const uint64_t packed = pack_short_id(id);
+        const auto [i, inserted] = packed == nonpacked_id
             ? other_ids.try_add(id, text_hash(id), nodes.size())
             : packed_ids.try_add(packed, nodes.size());
         if (inserted) nodes.push_back({id, i, 1});
@@ -162,20 +210,21 @@ public:
         if (other_ids.empty()) std::vector<size_t>().swap(canonical);
         std::vector<Node>().swap(nodes);
     }
-    ResolvedPerson packed_person(uint64_t packed) const {
+    ResolvedPerson person(uint64_t packed) const {
         const uint64_t hash = packed_alias_hash(packed);
         const uint64_t code = packed_ids.find(packed, hash);
-        if (code != PackedAliasIndex::missing) return {{nonpacked_alias | (code / partitions)}, shard(code)};
-        return {{packed}, shard(hash)};
+        if (code != PackedAliasIndex::missing) return {PersonKey::from_link(code / partitions), shard(code)};
+        return {PersonKey::from_packed(packed), shard(hash)};
     }
-    ResolvedPerson person(Text id, LaneExtras& extras) const {
-        const uint64_t packed = pack_alias(id);
-        if (packed != nonpacked_alias) return packed_person(packed);
+
+    ResolvedPerson person(Text id, uint64_t packed, std::vector<Text>& raw_names, size_t lane) const {
+        if (packed != nonpacked_id) return person(packed);
+
         const uint64_t hash = text_hash(id);
         const uint32_t index = other_ids.find(id, hash);
-        if (index == StringIndex::missing) return {{extras.add_name(id)}, shard(hash)};
+        if (index == StringIndex::missing) return {PersonKey::from_raw(id, raw_names, lane), shard(hash)};
         const size_t code = canonical[index];
-        return {{nonpacked_alias | (code / partitions)}, shard(code)};
+        return {PersonKey::from_link(code / partitions), shard(code)};
     }
 
     std::span<const Text> names(size_t partition) const {
@@ -209,34 +258,126 @@ struct Lookups {
     }
 };
 
-constexpr uint64_t wide_payload = nonpacked_alias;
-constexpr uint64_t invalid_user = UINT64_MAX;
+// Pack short user IDs while the CSV bytes are hot. Keep the original
+// pointer for unlinked and nonpacked IDs, and keep full lengths for fallbacks.
+struct ParsedAlias {
+    const char* bytes = nullptr;
+    uint64_t key_or_length = nonpacked_alias;
 
-// Purchases and outlying values retain their full amounts, times and user IDs.
-// Stable addresses are needed because later chunks may append to the deque.
-struct WidePayload {
-    Text user;
-    int64_t time, ingest;
+    ParsedAlias() = default;
+    explicit ParsedAlias(Text id) : bytes(id.data()), key_or_length(pack_alias(id)) {
+        if (key_or_length == nonpacked_alias) key_or_length |= id.size();
+    }
+
+    bool empty() const { return bytes == nullptr; }
+    uint64_t packed() const { return key_or_length & nonpacked_alias ? nonpacked_alias : key_or_length; }
+    Text text() const {
+        return {bytes, key_or_length & nonpacked_alias ? key_or_length & ~nonpacked_alias : 9};
+    }
+};
+static_assert(sizeof(ParsedAlias) == sizeof(Text));
+
+uint64_t pack_parsed_alias(const ParsedAlias& alias) {
+    const uint64_t key = alias.packed();
+    if (key != nonpacked_alias) return key;
+    const Text name = alias.text();
+    return name.size() == 8 ? pack_short_id(name) : nonpacked_id;
+}
+
+// Keep invalid candidates through deduplication. An empty user marks a record
+// that must be discarded only if it is the earliest copy.
+struct CandidatePayload {
+    ParsedAlias user;
+    int64_t time = 0;
+    int64_t ingest;
+    uint32_t price = 0;
+    uint32_t category = 0;
+};
+
+struct TimeOrigins {
+    int64_t event_ms;
+    int64_t ingest_seconds;
+};
+
+struct WideCandidateTimes {
+    int64_t event_ms;
+    int64_t ingest_ms;
+};
+static_assert(alignof(WideCandidateTimes) >= 2);
+
+// Store unsigned relative event milliseconds below the biased signed ingest
+// seconds. The top bit distinguishes an exact full-width fallback.
+struct PackedCandidate {
+    static constexpr uint64_t wide = uint64_t{1} << 63;
+    static constexpr uint64_t invalid_alias = UINT64_MAX;
+    static constexpr int64_t ingest_bias = int64_t{1} << 30;
+
+    uint64_t id;
+    uint64_t alias;
+    uint64_t times;
+
+    const WideCandidateTimes& wide_times() const {
+        return *reinterpret_cast<const WideCandidateTimes*>(
+            static_cast<uintptr_t>((times & ~wide) << 1));
+    }
+
+    int64_t ingest_time(TimeOrigins origin) const {
+        if (times & wide) return wide_times().ingest_ms;
+        const int64_t delta = static_cast<int64_t>(times >> 32) - ingest_bias;
+        return (origin.ingest_seconds + delta) * 1000;
+    }
+
+    bool earlier_than(const PackedCandidate& other, TimeOrigins origin) const {
+        if (((times | other.times) & wide) == 0) return (times >> 32) < (other.times >> 32);
+        return ingest_time(origin) < other.ingest_time(origin);
+    }
+
+    int64_t event_time(TimeOrigins origin) const {
+        return times & wide ? wide_times().event_ms : origin.event_ms + static_cast<uint32_t>(times);
+    }
+};
+static_assert(sizeof(PackedCandidate) == 24);
+
+uint64_t pack_candidate_times(const CandidatePayload& payload, TimeOrigins origin,
+                              std::deque<WideCandidateTimes>& overflow) {
+    // Invalid events still enter dedup with their original ingest. Their
+    // event time is never consumed because their user is empty.
+    const uint64_t event_delta = payload.user.empty() ? 0 :
+        static_cast<uint64_t>(payload.time) - static_cast<uint64_t>(origin.event_ms);
+    const int64_t ingest_delta = payload.ingest / 1000 - origin.ingest_seconds;
+
+    if (event_delta <= UINT32_MAX && payload.ingest % 1000 == 0 &&
+        ingest_delta >= -PackedCandidate::ingest_bias && ingest_delta < PackedCandidate::ingest_bias) {
+        const auto biased = static_cast<uint64_t>(ingest_delta + PackedCandidate::ingest_bias);
+        return (biased << 32) | event_delta;
+    }
+
+    // A deque preserves the addresses of existing elements during appends.
+    // Alignment leaves the pointer's low bit zero. Shift it away to make
+    // room for the wide marker without restricting the address range.
+    overflow.push_back({payload.time, payload.ingest});
+    const auto pointer = reinterpret_cast<uintptr_t>(&overflow.back());
+    return PackedCandidate::wide | (static_cast<uint64_t>(pointer) >> 1);
+}
+
+struct PackedPurchase {
+    size_t position;
     uint32_t price, category;
 };
 
-struct CandidatePayload {
-    uint64_t user;
-    union {
-        struct { uint32_t time, ingest; } delta;
-        const WidePayload* wide;
-    };
-
-    int64_t ingest_time(int64_t start) const {
-        return user == wide_payload ? wide->ingest : start + delta.ingest;
+// Raw alias handles are local to the parsing lane. Dedup compares only
+// event IDs and times. Routing later reads the originating lane's Text view.
+uint64_t pack_candidate_alias(const ParsedAlias& alias, std::vector<Text>& raw_names) {
+    if (alias.empty()) return PackedCandidate::invalid_alias;
+    const uint64_t key = pack_parsed_alias(alias);
+    if (key != nonpacked_id) return key;
+    if (raw_names.size() > name_handle_mask) {
+        throw std::overflow_error("too many raw candidate aliases");
     }
-};
-
-struct PackedCandidate {
-    uint64_t id;
-    CandidatePayload payload;
-};
-static_assert(sizeof(PackedCandidate) == 24);
+    const uint64_t handle = raw_names.size();
+    raw_names.push_back(alias.text());
+    return raw_name_tag | handle;
+}
 
 struct Candidate {
     uint64_t id_hash;
@@ -244,46 +385,31 @@ struct Candidate {
     CandidatePayload payload;
 };
 
-// Tag the eight-byte domain above every nine-byte code. Byte-identical IDs
-// always enter the same domain, including when CSV quoting differs.
-constexpr uint64_t nonpacked_event_id = UINT64_MAX;
+struct TimedEvent {
+    int64_t time;
+    uint32_t price, category;
+};
 
-uint64_t pack_event_id(Text id) {
-    if (id.size() == 9) {
-        const uint64_t key = pack_alias(id);
-        return key == nonpacked_alias ? nonpacked_event_id : key;
-    }
-    if (id.size() != 8) return nonpacked_event_id;
-
-    constexpr uint64_t byte_mask = 0x7f7f7f7f7f7f7f7fULL;
-    uint64_t bytes;
-    std::memcpy(&bytes, id.data(), sizeof(bytes));
-    if (bytes & ~byte_mask) return nonpacked_event_id;
-#if defined(__BMI2__)
-    return nonpacked_alias | _pext_u64(bytes, byte_mask);
-#else
-    uint64_t key = nonpacked_alias;
-    for (size_t i = 0; i < id.size(); ++i) {
-        key |= uint64_t{static_cast<unsigned char>(id[i])} << (7 * i);
-    }
-    return key;
-#endif
-}
-
-// Direct timestamps cover non-purchasing events after the epoch. Purchases
-// and negative timestamps point to complete records in the routing lane.
+// A nonnegative, non-purchase event needs only its own timestamp. Purchases
+// and pre-epoch events carry an index into their routing worker's full rows.
 struct Event {
     PersonKey person;
     uint64_t time_or_detail;
+    static constexpr uint64_t detail_tag = uint64_t{1} << 63;
 
-    TimedEvent decode(std::span<const LaneExtras> extras) const {
-        if ((time_or_detail & nonpacked_alias) == 0)
-            return {static_cast<int64_t>(time_or_detail), 0, 0};
-        const uint64_t location = time_or_detail & ~nonpacked_alias;
-        return extras[shard(location)].details[location / partitions];
+    static Event encode(PersonKey person, int64_t time, uint32_t price, uint32_t category,
+                        std::vector<TimedEvent>& details) {
+        if (price == 0 && time >= 0) return {person, static_cast<uint64_t>(time)};
+        const size_t index = details.size();
+        details.push_back({time, price, category});
+        return {person, detail_tag | index};
+    }
+
+    TimedEvent decode(const std::vector<TimedEvent>& details) const {
+        if ((time_or_detail & detail_tag) == 0) return {static_cast<int64_t>(time_or_detail), 0, 0};
+        return details[time_or_detail & ~detail_tag];
     }
 };
-static_assert(sizeof(Event) == 16);
 
 struct Click {
     PersonKey person;
@@ -291,44 +417,30 @@ struct Click {
     int64_t time;
     uint32_t campaign;
 };
+static_assert(sizeof(Event) == 16);
+static_assert(sizeof(Click) == 40);
 
 CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window window,
-                               const Lookups& lookups, std::deque<WidePayload>& wide_rows) {
-    const int64_t ingest = input::iso_time(row[3]);
-    CandidatePayload result{};
-    result.user = invalid_user;
-    int64_t time = window.start;
-    Text user;
-    uint32_t purchase_price = 0, category = 0;
-
-    if (!row[1].empty() && !row[5].empty()) {
-        time = input::timestamp(row[2]);
-        if (time >= window.start && time < window.end &&
-            (ingest <= time || static_cast<uint64_t>(ingest) - static_cast<uint64_t>(time) <= input::day_ms)) {
-            if (row[4] == "view" || row[4] == "cart") {
-                user = row[1];
-            } else if (row[4] == "purchase") {
-                const uint64_t price = input::decimal(row[6], 10000000);
-                if (price != 0 && price != UINT64_MAX) {
-                    user = row[1];
-                    purchase_price = static_cast<uint32_t>(price);
-                    category = lookups.category_for(row[5]);
-                }
-            }
-        }
+                               const Lookups& lookups) {
+    CandidatePayload candidate{{}, 0, input::iso_time(row[3])};
+    if (row[1].empty() || row[5].empty()) return candidate;
+    const int64_t time = input::timestamp(row[2]);
+    if (time < window.start || time >= window.end ||
+        (candidate.ingest > time && static_cast<uint64_t>(candidate.ingest) -
+             static_cast<uint64_t>(time) > input::day_ms)) {
+        return candidate;
     }
-    if (user.empty()) time = window.start;
-    else result.user = pack_alias(user);
-
-    const uint64_t ingest_delta = static_cast<uint64_t>(ingest) - static_cast<uint64_t>(window.start);
-    const uint64_t time_delta = static_cast<uint64_t>(time) - static_cast<uint64_t>(window.start);
-    if (purchase_price || result.user == wide_payload || ingest < window.start || ingest_delta > UINT32_MAX || time_delta > UINT32_MAX) {
-        result.user = wide_payload;
-        result.wide = &wide_rows.emplace_back(WidePayload{user, time, ingest, purchase_price, category});
-    } else {
-        result.delta = {static_cast<uint32_t>(time_delta), static_cast<uint32_t>(ingest_delta)};
+    if (row[4] == "purchase") {
+        const uint64_t price = input::decimal(row[6], 10000000);
+        if (price == 0 || price == UINT64_MAX) return candidate;
+        candidate.price = static_cast<uint32_t>(price);
+        candidate.category = lookups.category_for(row[5]);
+    } else if (row[4] != "view" && row[4] != "cart") {
+        return candidate;
     }
-    return result;
+    candidate.user = ParsedAlias(row[1]);
+    candidate.time = time;
+    return candidate;
 }
 
 // Deduplicate the exact numeric and full-byte domains independently. In
@@ -337,8 +449,19 @@ CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window win
 // of the original ID. In the numeric domain the table stores the exact ID.
 template<class Row>
 void deduplicate(std::vector<Shards<Row>>& lanes, size_t part,
-                 Shards<Event>& events, const LinkedIds& linked, int64_t start, LaneExtras& extras) {
+                 Shards<Event>& events, std::vector<TimedEvent>& details, const LinkedIds& linked,
+                 std::vector<Text>& raw_names, size_t worker, TimeOrigins origin,
+                 const RawNameLanes& raw_candidate_names,
+                 std::span<Shards<PackedPurchase>> purchases = {}) {
     constexpr bool packed = std::is_same_v<Row, PackedCandidate>;
+    const auto earlier = [&](const Row& candidate, const Row& winner) {
+        if constexpr (packed) return candidate.earlier_than(winner, origin);
+        else return candidate.payload.ingest < winner.payload.ingest;
+    };
+    const auto discard = [](Row& row) {
+        if constexpr (packed) row.alias = PackedCandidate::invalid_alias;
+        else row.payload.user = {};
+    };
     size_t count = 0;
     for (const auto& lane : lanes) count += lane[part].size();
     if (count == 0) return;
@@ -367,11 +490,11 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part,
                     else return entry.winner->id == candidate.id;
                 }();
                 if (matches) {
-                    if (candidate.payload.ingest_time(start) < entry.winner->payload.ingest_time(start)) {
-                        entry.winner->payload.user = invalid_user;
+                    if (earlier(candidate, *entry.winner)) {
+                        discard(*entry.winner);
                         entry.winner = &candidate;
                     } else {
-                        candidate.payload.user = invalid_user;
+                        discard(candidate);
                     }
                     break;
                 }
@@ -382,36 +505,58 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part,
 
     // Walk each domain's contiguous buffers instead of gathering and sorting
     // candidates or fetching the winners in hash-table order.
-    for (auto& lane : lanes) {
-        for (const Row& row : lane[part]) {
-            const CandidatePayload& winner = row.payload;
-            if (winner.user == invalid_user) continue;
-            ResolvedPerson person;
-            uint64_t time_code;
-            if (winner.user == wide_payload) {
-                if (winner.wide->user.empty()) continue;
-                person = linked.person(winner.wide->user, extras);
-                time_code = extras.routed_time(winner.wide->time, winner.wide->price, winner.wide->category);
-            } else {
-                // The packed key reconstructs the exact name on first use.
-                person = linked.packed_person(winner.user);
-                time_code = extras.routed_time(start + winner.delta.time, 0, 0);
+    for (size_t lane = 0; lane < lanes.size(); ++lane) {
+        auto& rows = lanes[lane][part];
+        if constexpr (packed) {
+            const auto& candidate_names = raw_candidate_names[lane];
+            const auto route = [&](const PackedCandidate& row, uint32_t price, uint32_t category) {
+                const uint64_t alias = row.alias;
+                if (alias == PackedCandidate::invalid_alias) return;
+                const ResolvedPerson person = (alias & name_kind_mask) == raw_name_tag
+                    ? linked.person(candidate_names[alias & name_handle_mask], nonpacked_id, raw_names, worker)
+                    : linked.person(alias);
+                events[person.partition].push_back(Event::encode(person.key, row.event_time(origin),
+                                                                 price, category, details));
+            };
+
+            // A losing candidate still consumes the extras at its position.
+            auto& charges = purchases[lane][part];
+            size_t purchase = 0;
+            size_t next = charges.empty() ? rows.size() : charges.front().position;
+            for (size_t index = 0; index < rows.size(); ++index) {
+                if (index == next) {
+                    const auto& charge = charges[purchase++];
+                    next = purchase == charges.size() ? rows.size() : charges[purchase].position;
+                    route(rows[index], charge.price, charge.category);
+                } else {
+                    route(rows[index], 0, 0);
+                }
             }
-            events[person.partition].push_back({person.key, time_code});
+            std::vector<PackedPurchase>().swap(charges);
+        } else {
+            for (const Row& row : rows) {
+                const auto& winner = row.payload;
+                if (winner.user.empty()) continue;
+                const ResolvedPerson person =
+                    linked.person(winner.user.text(), pack_parsed_alias(winner.user), raw_names, worker);
+                events[person.partition].push_back(Event::encode(person.key, winner.time, winner.price,
+                                                                 winner.category, details));
+            }
         }
-        std::vector<Row>().swap(lane[part]);
+        std::vector<Row>().swap(rows);
     }
 }
 
 void read_clicks(Text chunk, Shards<Click>& clicks, const LinkedIds& linked,
-                 const Lookups& lookups, input::Window window, LaneExtras& extras) {
+                 const Lookups& lookups, input::Window window,
+                 std::vector<Text>& raw_names, size_t worker) {
     input::read<4>(chunk, [&](const auto& row) {
         if (row[0].empty() || row[1].empty()) return;
         const int64_t time = input::timestamp(row[3]);
         if (time < window.start - input::week_ms || time >= window.end) return;
         const auto campaign = lookups.campaigns.find(row[2]);
         if (campaign == lookups.campaigns.end()) return;
-        const ResolvedPerson person = linked.person(row[1], extras);
+        const ResolvedPerson person = linked.person(row[1], pack_short_id(row[1]), raw_names, worker);
         clicks[person.partition].push_back({person.key, row[0], time, campaign->second});
     });
 }
@@ -433,26 +578,12 @@ struct GroupedPartition {
     std::unique_ptr<TimedClick[]> clicks;
 };
 
-using PackedNames = std::deque<std::array<char, 9>>;
-
-Text unpack_name(PackedNames& names, uint64_t key) {
-    auto& bytes = names.emplace_back();
-#if defined(__BMI2__)
-    const uint64_t first = _pdep_u64(key, 0x7f7f7f7f7f7f7f7fULL);
-    std::memcpy(bytes.data(), &first, sizeof(first));
-    bytes[8] = static_cast<char>(key >> 56);
-#else
-    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>((key >> (7 * i)) & 0x7f);
-#endif
-    return {bytes.data(), bytes.size()};
-}
-
 // Bucket into contiguous per-person ranges, then sort only the timestamps
 // within each range. Clicks for people without surviving events are discarded.
 GroupedPartition group_people(std::vector<Shards<Event>>& event_lanes,
                               std::vector<Shards<Click>>& click_lanes, size_t part,
-                              std::span<const Text> linked_names, PackedNames& packed_names,
-                              std::span<const LaneExtras> extras) {
+                              std::span<const Text> linked_names, const RawNameLanes& raw_names,
+                              DecodedNames& decoded_names, const std::vector<std::vector<TimedEvent>>& details) {
     size_t event_count = 0, click_count = 0;
     for (const auto& lane : event_lanes) event_count += lane[part].size();
     for (const auto& lane : click_lanes) click_count += lane[part].size();
@@ -481,10 +612,10 @@ GroupedPartition group_people(std::vector<Shards<Event>>& event_lanes,
                 id = group;
             } else if (person.packed()) {
                 const auto [group, inserted] = packed_groups.try_add(person.packed_key(), result.people.size());
-                if (inserted) result.people.push_back({unpack_name(packed_names, person.packed_key())});
+                if (inserted) result.people.push_back({decode_name(decoded_names, person.packed_key())});
                 id = group;
             } else {
-                const Text name = person.unlinked_name(extras);
+                const Text name = person.raw_name(raw_names);
                 const auto [group, inserted] = raw_groups.try_add(name, text_hash(name), result.people.size());
                 if (inserted) result.people.push_back({name});
                 id = group;
@@ -505,7 +636,7 @@ GroupedPartition group_people(std::vector<Shards<Event>>& event_lanes,
                 id = group == PackedAliasIndex::missing ? StringIndex::missing
                                                        : static_cast<uint32_t>(group);
             } else {
-                const Text name = person.unlinked_name(extras);
+                const Text name = person.raw_name(raw_names);
                 id = raw_groups.find(name, text_hash(name));
             }
             if (id != StringIndex::missing) ++result.people[id].click_end;
@@ -523,12 +654,13 @@ GroupedPartition group_people(std::vector<Shards<Event>>& event_lanes,
     result.events = std::make_unique_for_overwrite<TimedEvent[]>(events);
     if (clicks != 0) result.clicks = std::make_unique_for_overwrite<TimedClick[]>(clicks);
     size_t i = 0;
-    for (auto& lane : event_lanes) {
-        for (const Event& event : lane[part]) {
+    for (size_t lane = 0; lane < event_lanes.size(); ++lane) {
+        auto& rows = event_lanes[lane][part];
+        for (const Event& event : rows) {
             const size_t offset = result.people[event_person[i++]].event_end++;
-            result.events[offset] = event.decode(extras);
+            result.events[offset] = event.decode(details[lane]);
         }
-        std::vector<Event>().swap(lane[part]);
+        std::vector<Event>().swap(rows);
     }
     i = 0;
     for (auto& lane : click_lanes) {
@@ -757,13 +889,16 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     // A capacity hint only. Vectors still grow normally for smaller rows or
     // uneven work distribution.
     const size_t candidate_hint = event_bytes / (64 * partitions * threads);
-    std::vector<LaneExtras> extras(threads);
-    for (size_t i = 0; i < threads; ++i) extras[i].lane = i;
-    std::vector<std::deque<WidePayload>> wide_rows(threads);
+    const TimeOrigins time_origin{window.start, window.start / 1000};
+    std::vector<std::deque<WideCandidateTimes>> wide_candidate_times(threads);
+    RawNameLanes raw_candidate_names(threads);
     std::vector<Shards<PackedCandidate>> packed_candidate_lanes(threads);
+    std::vector<Shards<PackedPurchase>> packed_purchase_lanes(threads);
     std::vector<Shards<Candidate>> candidate_lanes(threads);
     std::vector<Shards<Event>> event_lanes(threads);
+    std::vector<std::vector<TimedEvent>> event_details(threads);
     std::vector<Shards<Click>> click_lanes(threads);
+    RawNameLanes raw_names(threads);
 
     parallel(1 + event_chunks.size() + click_chunks.size(), threads, [&](size_t lane, size_t job) {
         if (job == 0) {
@@ -779,7 +914,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         if (job >= event_chunks.size()) {
             const auto ready = links_ready;
             read_clicks(click_chunks[job - event_chunks.size()], click_lanes[lane],
-                        ready.get(), lookups, window, extras[lane]);
+                        ready.get(), lookups, window, raw_names[lane], lane);
             return;
         }
         if (candidate_hint >= 1024 && packed_candidate_lanes[lane][0].capacity() == 0) {
@@ -789,11 +924,18 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
             const Text id = row[0];
             if (id.empty()) return;
 
-            const uint64_t packed = pack_event_id(id);
-            const auto payload = event_payload(row, window, lookups, wide_rows[lane]);
-            if (packed != nonpacked_event_id) {
+            const uint64_t packed = pack_short_id(id);
+            const auto payload = event_payload(row, window, lookups);
+            if (packed != nonpacked_id) {
                 const size_t part = shard(packed_alias_hash(packed));
-                packed_candidate_lanes[lane][part].push_back({packed, payload});
+                auto& candidates = packed_candidate_lanes[lane][part];
+                if (payload.price != 0) {
+                    packed_purchase_lanes[lane][part].push_back(
+                        {candidates.size(), payload.price, payload.category});
+                }
+                const uint64_t times = pack_candidate_times(payload, time_origin, wide_candidate_times[lane]);
+                const uint64_t alias = pack_candidate_alias(payload.user, raw_candidate_names[lane]);
+                candidates.push_back({packed, alias, times});
             } else {
                 const uint64_t hash = text_hash(id);
                 candidate_lanes[lane][shard(hash)].push_back({hash, id, payload});
@@ -808,17 +950,23 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         if (event_hint >= 1024 && event_lanes[lane][0].capacity() == 0) {
             for (auto& events : event_lanes[lane]) events.reserve(event_hint);
         }
-        deduplicate(packed_candidate_lanes, part, event_lanes[lane], linked, window.start, extras[lane]);
-        deduplicate(candidate_lanes, part, event_lanes[lane], linked, window.start, extras[lane]);
+        deduplicate(packed_candidate_lanes, part, event_lanes[lane], event_details[lane],
+                    linked, raw_names[lane], lane,
+                    time_origin, raw_candidate_names, packed_purchase_lanes);
+        deduplicate(candidate_lanes, part, event_lanes[lane], event_details[lane],
+                    linked, raw_names[lane], lane,
+                    time_origin, raw_candidate_names);
     });
+    raw_candidate_names.clear();
+    wide_candidate_times.clear();
     timer.mark("event dedup and routing");
 
-    wide_rows.clear();
-    std::array<PackedNames, partitions> packed_names;
+    std::array<DecodedNames, partitions> decoded_names;
     Shards<UserDay> user_rows;
     std::array<CampaignTotals, partitions> campaign_totals;
     parallel(partitions, threads, [&](size_t, size_t part) {
-        auto grouped = group_people(event_lanes, click_lanes, part, linked.names(part), packed_names[part], extras);
+        auto grouped = group_people(event_lanes, click_lanes, part, linked.names(part),
+                                    raw_names, decoded_names[part], event_details);
         summarize(grouped, lookups, user_rows[part], campaign_totals[part]);
     });
     timer.mark("sort, sessionize and attribute");

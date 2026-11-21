@@ -554,6 +554,174 @@ CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window win
     return candidate;
 }
 
+constexpr size_t max_bucket_count = 2048;
+constexpr size_t max_bucket_categories = 64;
+constexpr size_t tagged_fragment = size_t{1} << (std::numeric_limits<size_t>::digits - 1);
+
+uint64_t window_bucket_count(input::Window window) {
+    const uint64_t span = static_cast<uint64_t>(window.end) - static_cast<uint64_t>(window.start);
+    return 1 + (span - 1) / session_gap;
+}
+
+// Every key in this table is exact. Sampling is only a decision about which
+// winners are worth aggregating. Dropping an entire key would leave its rows
+// on the ordinary route.
+class WinnerSelection {
+    static constexpr size_t max_aliases = 128;
+    static constexpr size_t slots = 4096;
+    std::array<uint8_t, slots> table{};
+    std::vector<uint64_t> aliases;
+
+public:
+    explicit WinnerSelection(std::vector<std::vector<uint64_t>>& samples) {
+        size_t count = 0;
+        for (const auto& lane : samples) count += lane.size();
+        std::vector<uint64_t> keys;
+        keys.reserve(count);
+        for (auto& lane : samples) {
+            keys.insert(keys.end(), lane.begin(), lane.end());
+            std::vector<uint64_t>().swap(lane);
+        }
+        std::sort(keys.begin(), keys.end());
+        std::vector<std::pair<size_t, uint64_t>> frequent;
+        for (size_t i = 0; i < keys.size();) {
+            const size_t first = i++;
+            while (i < keys.size() && keys[i] == keys[first]) ++i;
+            if (i - first >= 16) frequent.emplace_back(i - first, keys[first]);
+        }
+        std::sort(frequent.begin(), frequent.end(), [](auto a, auto b) {
+            return a.first != b.first ? a.first > b.first : a.second < b.second;
+        });
+        for (size_t i = 0; i < std::min(max_aliases, frequent.size()); ++i) {
+            const uint64_t key = frequent[i].second;
+            size_t slot = packed_alias_hash(key) & (slots - 1);
+            while (table[slot] != 0) slot = (slot + 1) & (slots - 1);
+            aliases.push_back(key);
+            table[slot] = static_cast<uint8_t>(aliases.size());
+        }
+    }
+
+    size_t size() const { return aliases.size(); }
+    uint64_t key(size_t index) const { return aliases[index]; }
+
+    // The caller reuses the same hash to route an ordinary packed winner.
+    size_t lookup(uint64_t alias, uint64_t hash) const {
+        size_t slot = hash & (slots - 1);
+        while (const uint8_t entry = table[slot]) {
+            const size_t i = entry - 1;
+            if (aliases[i] == alias) return i;
+            slot = (slot + 1) & (slots - 1);
+        }
+        return SIZE_MAX;
+    }
+};
+
+struct WinnerBin {
+    uint32_t first = 0, last = 0, count = 0;
+
+    bool add(uint32_t offset) {
+        if (count == UINT32_MAX) return false;
+        if (count == 0) first = last = offset;
+        else {
+            first = std::min(first, offset);
+            last = std::max(last, offset);
+        }
+        ++count;
+        return true;
+    }
+};
+static_assert(sizeof(WinnerBin) == 12);
+
+struct WorkerAliasBins {
+    std::vector<WinnerBin> bins;
+    std::vector<uint16_t> occupied;
+
+    bool add(size_t bucket_count, uint32_t offset) {
+        if (bins.empty()) bins.resize(bucket_count);
+        const auto bucket = static_cast<uint16_t>(offset / session_gap);
+        auto& bin = bins[bucket];
+        if (bin.count == 0) occupied.push_back(bucket);
+        return bin.add(offset);
+    }
+};
+
+struct MergedWinnerBin { uint32_t first = 0, last = 0; size_t count = 0; };
+struct WinnerAliasSummary {
+    uint64_t alias;
+    size_t count = 0;
+    std::vector<MergedWinnerBin> bins;
+};
+
+class WorkerWinnerBins {
+    const WinnerSelection& selection;
+    size_t bucket_count;
+    std::vector<WorkerAliasBins> aliases;
+
+public:
+    WorkerWinnerBins(const WinnerSelection& selected, size_t count)
+        : selection(selected), bucket_count(count), aliases(selected.size()) {}
+
+    bool add(uint64_t key, uint64_t hash, int64_t time, int64_t origin) {
+        const size_t i = selection.lookup(key, hash);
+        if (i == SIZE_MAX) return false;
+        // Selection is disabled if the manifest does not bound this offset.
+        const uint32_t offset = static_cast<uint32_t>(static_cast<uint64_t>(time) -
+                                                      static_cast<uint64_t>(origin));
+        return aliases[i].add(bucket_count, offset);
+    }
+    const WorkerAliasBins& at(size_t i) const { return aliases[i]; }
+};
+
+Shards<WinnerAliasSummary> merge_winner_bins(const WinnerSelection& selected,
+                                            std::span<const WorkerWinnerBins> workers,
+                                            size_t bucket_count, bool profile, size_t raw_rows) {
+    Shards<WinnerAliasSummary> result;
+    if (selected.size() == 0) {
+        if (profile) std::cerr << "winner_bins selected_aliases=0 summarized_rows=0 raw_rows=" << raw_rows
+                               << " partial_aliases=0 partial_bins=0 merged_aliases=0 merged_bins=0"
+                               << " summary_header_bytes=" << sizeof(WinnerAliasSummary)
+                               << " merged_bin_bytes=" << sizeof(MergedWinnerBin) << '\n';
+        return result;
+    }
+    std::vector<MergedWinnerBin> merged(bucket_count);
+    size_t partial_aliases = 0, partial_bins = 0, merged_aliases = 0, merged_bins = 0, summarized = 0;
+    for (size_t i = 0; i < selected.size(); ++i) {
+        WinnerAliasSummary summary{selected.key(i), 0, {}};
+        for (const auto& worker : workers) {
+            const auto& alias = worker.at(i);
+            partial_aliases += !alias.occupied.empty();
+            partial_bins += alias.occupied.size();
+            for (uint16_t bucket : alias.occupied) {
+                auto& dest = merged[bucket];
+                const auto& source = alias.bins[bucket];
+                if (dest.count == 0) dest = {source.first, source.last, source.count};
+                else {
+                    dest.first = std::min(dest.first, source.first);
+                    dest.last = std::max(dest.last, source.last);
+                    dest.count += source.count;
+                }
+                summary.count += source.count;
+            }
+        }
+        if (summary.count == 0) continue;
+        for (auto& bin : merged) {
+            if (bin.count == 0) continue;
+            summary.bins.push_back(bin);
+            bin.count = 0;
+        }
+        ++merged_aliases;
+        summarized += summary.count;
+        merged_bins += summary.bins.size();
+        result[shard(packed_alias_hash(summary.alias))].push_back(std::move(summary));
+    }
+    if (profile) std::cerr << "winner_bins selected_aliases=" << selected.size()
+        << " summarized_rows=" << summarized << " raw_rows=" << raw_rows << " partial_aliases=" << partial_aliases
+        << " partial_bins=" << partial_bins << " merged_aliases=" << merged_aliases << " merged_bins=" << merged_bins
+        << " summary_header_bytes=" << sizeof(WinnerAliasSummary) << " merged_bin_bytes=" << sizeof(MergedWinnerBin)
+        << '\n';
+    return result;
+}
+
 // Deduplicate the exact numeric and full-byte domains independently. In
 // each domain candidates in a partition share the low hash bits, so probe
 // with the remaining bits. A hash match in the byte domain requires equality
@@ -562,7 +730,7 @@ template<class Row, class TimelineEvent>
 void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<TimelineEvent>>& events,
                  std::vector<Text>& raw_names, size_t worker, TimeOrigins origin,
                  const RawNameLanes& raw_candidate_names,
-                 std::span<Shards<PackedPurchase>> purchases = {}) {
+                 WorkerWinnerBins& winner_bins, std::span<Shards<PackedPurchase>> purchases = {}) {
     constexpr bool packed = std::is_same_v<Row, PackedCandidate>;
     const auto earlier = [&](const Row& candidate, const Row& winner) {
         if constexpr (packed) return candidate.earlier_than(winner, origin);
@@ -613,6 +781,18 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<Time
         }
     }
 
+    const auto emit_packed = [&](uint64_t alias, int64_t time, uint32_t price, uint32_t category) {
+        const uint64_t hash = packed_alias_hash(alias);
+        if (price == 0 && winner_bins.add(alias, hash, time, origin.event_ms)) return;
+        events[shard(hash)].push_back({PersonKey::from_packed(alias),
+            TimelineEvent::make(time, price, category, origin.event_ms)});
+    };
+    const auto emit_raw = [&](Text name, int64_t time, uint32_t price, uint32_t category) {
+        const auto destination = routed_alias(name, nonpacked_id, raw_names, worker);
+        events[destination.partition].push_back({destination.key,
+            TimelineEvent::make(time, price, category, origin.event_ms)});
+    };
+
     // Walk each domain's contiguous buffers instead of gathering and sorting
     // candidates or fetching the winners in hash-table order.
     for (size_t lane = 0; lane < lanes.size(); ++lane) {
@@ -622,11 +802,12 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<Time
             const auto route = [&](const PackedCandidate& row, uint32_t price, uint32_t category) {
                 const uint64_t alias = row.alias;
                 if (alias == PackedCandidate::invalid_alias) return;
-                const auto destination = (alias & name_kind_mask) == raw_name_tag
-                    ? routed_alias(candidate_names[alias & name_handle_mask], nonpacked_id, raw_names, worker)
-                    : routed_alias(alias);
-                events[destination.partition].push_back({destination.key,
-                    TimelineEvent::make(row.event_time(origin), price, category, origin.event_ms)});
+                const int64_t time = row.event_time(origin);
+                if ((alias & name_kind_mask) == raw_name_tag) {
+                    emit_raw(candidate_names[alias & name_handle_mask], time, price, category);
+                } else {
+                    emit_packed(alias, time, price, category);
+                }
             };
 
             // A losing candidate still consumes the extras at its position.
@@ -647,10 +828,12 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<Time
             for (const Row& row : rows) {
                 const auto& winner = row.payload;
                 if (winner.user.empty()) continue;
-                const auto destination =
-                    routed_alias(winner.user.text(), pack_parsed_alias(winner.user), raw_names, worker);
-                events[destination.partition].push_back({destination.key,
-                    TimelineEvent::make(winner.time, winner.price, winner.category, origin.event_ms)});
+                const uint64_t alias = pack_parsed_alias(winner.user);
+                if (alias == nonpacked_id) {
+                    emit_raw(winner.user.text(), winner.time, winner.price, winner.category);
+                } else {
+                    emit_packed(alias, winner.time, winner.price, winner.category);
+                }
             }
         }
         std::vector<Row>().swap(rows);
@@ -677,8 +860,37 @@ struct AliasGroup {
     size_t event_end = 0, click_end = 0;
 };
 
+// Keep the usual fragment at two words. Only the selected aliases need to
+// carry both regular rows (including all purchases) and a nonpurchase summary.
+template<class Row>
+struct MixedWinnerEvents {
+    std::span<Row> ordinary;
+    const WinnerAliasSummary* summary;
+};
+
+template<class Row>
+class FragmentEvents {
+    union {
+        Row* data = nullptr;
+        const MixedWinnerEvents<Row>* mixed;
+    };
+    size_t count = 0;
+
+public:
+    FragmentEvents() = default;
+    explicit FragmentEvents(std::span<Row> rows) : data(rows.data()), count(rows.size()) {}
+    explicit FragmentEvents(const MixedWinnerEvents<Row>& item)
+        : mixed(&item), count(tagged_fragment | (item.ordinary.size() + item.summary->count)) {}
+
+    bool reduced() const { return (count & tagged_fragment) != 0; }
+    size_t size() const { return count & ~tagged_fragment; }
+    std::span<Row> rows() const { return reduced() ? mixed->ordinary : std::span<Row>(data, count); }
+    const WinnerAliasSummary& summary() const { return *mixed->summary; }
+};
+
 template<class TimelineEvent>
 struct AliasStorage {
+    std::vector<MixedWinnerEvents<TimelineEvent>> mixed;
     std::unique_ptr<TimelineEvent[]> events;
     std::unique_ptr<TimedClick[]> clicks;
 };
@@ -686,7 +898,7 @@ struct AliasStorage {
 template<class TimelineEvent>
 struct PersonFragment {
     PersonKey person;
-    std::span<TimelineEvent> events;
+    FragmentEvents<TimelineEvent> events;
     std::span<TimedClick> clicks;
     PersonFragment* next = nullptr;
 };
@@ -700,12 +912,13 @@ template<class TimelineEvent>
 AliasStorage<TimelineEvent> group_aliases(std::vector<Shards<Event<TimelineEvent>>>& event_lanes,
                                          std::vector<Shards<Click>>& click_lanes, size_t part,
                                          const RawNameLanes& raw_names, const LinkedIds& linked,
-                                         FragmentShards<TimelineEvent>& fragments) {
+                                         FragmentShards<TimelineEvent>& fragments,
+                                         std::span<const WinnerAliasSummary> summaries) {
     size_t event_count = 0, click_count = 0;
     for (const auto& lane : event_lanes) event_count += lane[part].size();
     for (const auto& lane : click_lanes) click_count += lane[part].size();
     AliasStorage<TimelineEvent> storage;
-    if (event_count == 0 && click_count == 0) return storage;
+    if (event_count == 0 && click_count == 0 && summaries.empty()) return storage;
 
     // All packed aliases here share the low hash bits used by routing.
     const size_t row_count = event_count + click_count;
@@ -721,6 +934,12 @@ AliasStorage<TimelineEvent> group_aliases(std::vector<Shards<Event<TimelineEvent
         if (inserted) groups.push_back({alias});
         return id;
     };
+
+    // Make a single group for residual purchases, ordinary clicks and all
+    // summaries of an alias. A completely summarized unlinked user still
+    // receives a group even when it has no clicks. Summary groups come first.
+    for (const auto& summary : summaries) group_for(PersonKey::from_packed(summary.alias));
+    storage.mixed.reserve(summaries.size());
 
     std::vector<uint32_t> event_group, click_group;
     event_group.reserve(event_count);
@@ -767,7 +986,8 @@ AliasStorage<TimelineEvent> group_aliases(std::vector<Shards<Event<TimelineEvent
     }
 
     size_t event_begin = 0, click_begin = 0;
-    for (const auto& group : groups) {
+    for (size_t group_id = 0; group_id < groups.size(); ++group_id) {
+        const auto& group = groups[group_id];
         const auto person = linked.person(group.alias, part, raw_names);
         std::span<TimelineEvent> event_span;
         std::span<TimedClick> click_span;
@@ -780,8 +1000,11 @@ AliasStorage<TimelineEvent> group_aliases(std::vector<Shards<Event<TimelineEvent
         event_begin = group.event_end;
         click_begin = group.click_end;
         // An unlinked alias cannot share its clicks with another fragment.
-        if (!event_span.empty() || person.key.linked()) {
-            fragments[person.partition].push_back({person.key, event_span, click_span});
+        if (group_id < summaries.size()) {
+            auto& mixed = storage.mixed.emplace_back(MixedWinnerEvents<TimelineEvent>{event_span, &summaries[group_id]});
+            fragments[person.partition].push_back({person.key, FragmentEvents<TimelineEvent>(mixed), click_span});
+        } else if (!event_span.empty() || person.key.linked()) {
+            fragments[person.partition].push_back({person.key, FragmentEvents<TimelineEvent>(event_span), click_span});
         }
     }
     return storage;
@@ -1024,17 +1247,14 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
     };
 
     constexpr size_t minimum_bucket_events = 16;
-    constexpr size_t maximum_buckets = 2048;
-    constexpr size_t maximum_categories = 64;
     constexpr uint64_t width = session_gap;
-    static_assert(maximum_buckets <= UINT16_MAX + 1);
-    static_assert(maximum_buckets * width <= (uint64_t{1} << 32));
-    const uint64_t span = static_cast<uint64_t>(window.end) - static_cast<uint64_t>(origin);
-    const uint64_t buckets = 1 + (span - 1) / width; // The manifest window is nonempty.
+    static_assert(max_bucket_count <= UINT16_MAX + 1);
+    static_assert(max_bucket_count * width <= (uint64_t{1} << 32));
+    const uint64_t buckets = window_bucket_count(window);
     const size_t categories = lookups.category.size();
     const auto use_buckets = [&](size_t event_count) {
-        return event_count >= minimum_bucket_events && buckets <= maximum_buckets &&
-               categories <= maximum_categories;
+        return event_count >= minimum_bucket_events && buckets <= max_bucket_count &&
+               categories <= max_bucket_categories;
     };
 
     struct Bin {
@@ -1051,32 +1271,43 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
             touched.reserve(buckets);
         }
         touched.clear();
-        visit_spans([&](std::span<const TimelineEvent> events) {
-            for (const auto& event : events) {
+        const auto collect_range = [&](size_t index, uint32_t first, uint32_t last, size_t count) {
+            auto& bin = bins[index];
+            if (bin.count == 0) {
+                touched.push_back(static_cast<uint16_t>(index));
+                bin.first = first;
+                bin.last = last;
+            } else {
+                bin.first = std::min(bin.first, first);
+                bin.last = std::max(bin.last, last);
+            }
+            bin.count += count;
+        };
+        const auto collect_purchase = [&](size_t index, uint32_t category, int64_t amount) {
+            if (!by_category) by_category = std::make_unique_for_overwrite<int64_t[]>(buckets * categories);
+            auto& subtotal = by_category[index * categories + category];
+            auto& purchased = bins[index].purchased;
+            const uint64_t bit = uint64_t{1} << category;
+            if (purchased & bit) {
+                subtotal += amount;
+            } else {
+                subtotal = amount;
+                purchased |= bit;
+            }
+        };
+        visit_spans([&](FragmentEvents<TimelineEvent> fragment) {
+            if (fragment.reduced()) {
+                for (const auto& bin : fragment.summary().bins)
+                    collect_range(bin.first / width, bin.first, bin.last, bin.count);
+            }
+            // Purchases always stay on the ordinary path, including those
+            // belonging to a selected alias or to another alias of this person.
+            for (const auto& event : fragment.rows()) {
                 const auto offset = static_cast<uint32_t>(static_cast<uint64_t>(event.absolute_time(origin)) -
                                                           static_cast<uint64_t>(origin));
-                const size_t bucket = offset / width;
-                auto& bin = bins[bucket];
-                if (bin.count == 0) {
-                    touched.push_back(static_cast<uint16_t>(bucket));
-                    bin.first = bin.last = offset;
-                } else {
-                    bin.first = std::min(bin.first, offset);
-                    bin.last = std::max(bin.last, offset);
-                }
-                ++bin.count;
-                if (const uint32_t price = event.price(); price != 0) {
-                    if (!by_category) by_category = std::make_unique_for_overwrite<int64_t[]>(buckets * categories);
-                    const uint32_t category = event.category();
-                    auto& subtotal = by_category[bucket * categories + category];
-                    const uint64_t bit = uint64_t{1} << category;
-                    if (bin.purchased & bit) {
-                        subtotal += price;
-                    } else {
-                        subtotal = price;
-                        bin.purchased |= bit;
-                    }
-                }
+                const size_t index = offset / width;
+                collect_range(index, offset, offset, 1);
+                if (event.price() != 0) collect_purchase(index, event.category(), event.price());
             }
         });
 
@@ -1137,7 +1368,7 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
     const auto summarize_timeline = [&](Text person, std::span<TimelineEvent> events, std::span<TimedClick> clicks) {
         if (events.empty()) return;
         if (use_buckets(events.size())) {
-            summarize_buckets(person, clicks, [&](const auto& collect) { collect(events); });
+            summarize_buckets(person, clicks, [&](const auto& collect) { collect(FragmentEvents<TimelineEvent>(events)); });
             return;
         }
         std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
@@ -1180,6 +1411,14 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
         finish_day(daily);
     };
 
+    const auto summarize_fragment = [&](Text person, const PersonFragment<TimelineEvent>& fragment) {
+        if (fragment.events.reduced()) {
+            summarize_buckets(person, fragment.clicks, [&](const auto& collect) { collect(fragment.events); });
+        } else {
+            summarize_timeline(person, fragment.events.rows(), fragment.clicks);
+        }
+    };
+
     // Each canonical partition owns its fragments and their row ranges.
     // Unlinked names occur once by construction; linked ordinals directly
     // index their fragment chains without a second string lookup.
@@ -1194,7 +1433,7 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
             } else {
                 const Text name = person.packed() ? decode_name(decoded_names, person.packed_key())
                                                   : person.raw_name(raw_names);
-                summarize_timeline(name, fragment.events, fragment.clicks);
+                summarize_fragment(name, fragment);
             }
         }
     }
@@ -1205,17 +1444,19 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
         const auto* head = linked_heads[ordinal];
         if (head == nullptr) continue;
         if (head->next == nullptr) {
-            summarize_timeline(linked_names[ordinal], head->events, head->clicks);
+            summarize_fragment(linked_names[ordinal], *head);
             continue;
         }
         size_t event_count = 0, click_count = 0;
+        bool has_summary = false;
         for (auto* fragment = head; fragment != nullptr; fragment = fragment->next) {
             event_count += fragment->events.size();
+            has_summary |= fragment->events.reduced();
             click_count += fragment->clicks.size();
         }
         if (event_count == 0) continue;
 
-        const bool bucket_events = use_buckets(event_count);
+        const bool bucket_events = has_summary || use_buckets(event_count);
         if (!bucket_events) {
             merged_events.clear();
             merged_events.reserve(event_count);
@@ -1223,8 +1464,9 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
         merged_clicks.clear();
         merged_clicks.reserve(click_count);
         for (auto* fragment = head; fragment != nullptr; fragment = fragment->next) {
-            if (!bucket_events && !fragment->events.empty()) {
-                merged_events.insert(merged_events.end(), fragment->events.begin(), fragment->events.end());
+            if (!bucket_events && fragment->events.size() != 0) {
+                const auto rows = fragment->events.rows();
+                merged_events.insert(merged_events.end(), rows.begin(), rows.end());
             }
             if (!fragment->clicks.empty()) {
                 merged_clicks.insert(merged_clicks.end(), fragment->clicks.begin(), fragment->clicks.end());
@@ -1304,6 +1546,9 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     const TimeOrigins time_origin{window.start, window.start / 1000};
     std::vector<std::deque<WideCandidateTimes>> wide_candidate_times(threads);
     RawNameLanes raw_candidate_names(threads);
+    const uint64_t bucket_count = window_bucket_count(window);
+    const bool selectable = bucket_count <= max_bucket_count && lookups.category.size() <= max_bucket_categories;
+    std::vector<std::vector<uint64_t>> alias_samples(threads);
     std::vector<Shards<PackedCandidate>> packed_candidate_lanes(threads);
     std::vector<Shards<PackedPurchase>> packed_purchase_lanes(threads);
     std::vector<Shards<Candidate>> candidate_lanes(threads);
@@ -1332,7 +1577,8 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
             const uint64_t packed = pack_short_id(id);
             const auto payload = event_payload(row, window, lookups);
             if (packed != nonpacked_id) {
-                const size_t part = shard(packed_alias_hash(packed));
+                const uint64_t hash = packed_alias_hash(packed);
+                const size_t part = shard(hash);
                 auto& candidates = packed_candidate_lanes[lane][part];
                 if (payload.price != 0) {
                     packed_purchase_lanes[lane][part].push_back(
@@ -1340,6 +1586,9 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
                 }
                 const uint64_t times = pack_candidate_times(payload, time_origin, wide_candidate_times[lane]);
                 const uint64_t alias = pack_candidate_alias(payload.user, raw_candidate_names[lane]);
+                if (((hash >> 7) & 255) == 0 && selectable && payload.price == 0 && alias < linked_name_tag) {
+                    alias_samples[lane].push_back(alias);
+                }
                 candidates.push_back({packed, alias, times});
             } else {
                 const uint64_t hash = text_hash(id);
@@ -1349,6 +1598,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     });
     timer.mark("build links and parse events and clicks");
     const LinkedIds& linked = *linked_ids;
+    const WinnerSelection selected(alias_samples);
 
     std::array<DecodedNames, partitions> decoded_names;
     Shards<UserDay> user_rows;
@@ -1359,18 +1609,29 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     }
     const auto build_timelines = [&]<class TimelineEvent>() {
         std::vector<Shards<Event<TimelineEvent>>> event_lanes(threads);
+        std::vector<WorkerWinnerBins> worker_bins;
+        worker_bins.reserve(threads);
+        for (size_t lane = 0; lane < threads; ++lane) worker_bins.emplace_back(selected, bucket_count);
         const size_t event_hint = event_bytes / (72 * partitions * threads);
         parallel(partitions, threads, [&](size_t lane, size_t part) {
             if (event_hint >= 1024 && event_lanes[lane][0].capacity() == 0) {
                 for (auto& events : event_lanes[lane]) events.reserve(event_hint);
             }
             deduplicate(packed_candidate_lanes, part, event_lanes[lane], raw_names[lane], lane,
-                        time_origin, raw_candidate_names, packed_purchase_lanes);
+                        time_origin, raw_candidate_names, worker_bins[lane], packed_purchase_lanes);
             deduplicate(candidate_lanes, part, event_lanes[lane], raw_names[lane], lane,
-                        time_origin, raw_candidate_names);
+                        time_origin, raw_candidate_names, worker_bins[lane]);
         });
         raw_candidate_names.clear();
         wide_candidate_times.clear();
+        const bool profile = std::getenv("SHOPPING_TIMING") != nullptr;
+        size_t raw_rows = 0;
+        if (profile) {
+            for (const auto& lane : event_lanes)
+                for (const auto& rows : lane) raw_rows += rows.size();
+        }
+        const auto summaries = merge_winner_bins(selected, worker_bins, bucket_count, profile, raw_rows);
+        std::vector<WorkerWinnerBins>().swap(worker_bins);
         timer.mark("event dedup and alias routing");
 
         // Fragment spans reference these arrays through the final sort pass.
@@ -1378,7 +1639,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         auto fragments = std::make_unique<std::array<FragmentShards<TimelineEvent>, partitions>>();
         parallel(partitions, threads, [&](size_t, size_t part) {
             alias_rows[part] = group_aliases<TimelineEvent>(
-                event_lanes, click_lanes, part, raw_names, linked, (*fragments)[part]);
+                event_lanes, click_lanes, part, raw_names, linked, (*fragments)[part], summaries[part]);
         });
         timer.mark("group aliases and resolve fragments");
         parallel(partitions, threads, [&](size_t lane, size_t part) {

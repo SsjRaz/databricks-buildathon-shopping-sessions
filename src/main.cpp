@@ -12,6 +12,7 @@
 #include <mutex>
 #include <span>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 
 namespace {
@@ -199,15 +200,51 @@ static_assert(sizeof(ParsedAlias) == sizeof(Text));
 
 // Keep invalid candidates through deduplication. An empty user marks a record
 // that must be discarded only if it is the earliest copy.
-struct Candidate {
-    uint64_t id_hash;
-    Text id;
+struct CandidatePayload {
     ParsedAlias user;
     int64_t time = 0;
     int64_t ingest;
     uint32_t price = 0;
     uint32_t category = 0;
 };
+
+struct PackedCandidate {
+    uint64_t id;
+    CandidatePayload payload;
+};
+static_assert(sizeof(PackedCandidate) == 48);
+
+struct Candidate {
+    uint64_t id_hash;
+    Text id;
+    CandidatePayload payload;
+};
+
+// Tag the eight-byte domain above every nine-byte code. Byte-identical IDs
+// always enter the same domain, including when CSV quoting differs.
+constexpr uint64_t nonpacked_event_id = UINT64_MAX;
+
+uint64_t pack_event_id(Text id) {
+    if (id.size() == 9) {
+        const uint64_t key = pack_alias(id);
+        return key == nonpacked_alias ? nonpacked_event_id : key;
+    }
+    if (id.size() != 8) return nonpacked_event_id;
+
+    constexpr uint64_t byte_mask = 0x7f7f7f7f7f7f7f7fULL;
+    uint64_t bytes;
+    std::memcpy(&bytes, id.data(), sizeof(bytes));
+    if (bytes & ~byte_mask) return nonpacked_event_id;
+#if defined(__BMI2__)
+    return nonpacked_alias | _pext_u64(bytes, byte_mask);
+#else
+    uint64_t key = nonpacked_alias;
+    for (size_t i = 0; i < id.size(); ++i) {
+        key |= uint64_t{static_cast<unsigned char>(id[i])} << (7 * i);
+    }
+    return key;
+#endif
+}
 
 struct Event {
     PersonKey person;
@@ -222,9 +259,9 @@ struct Click {
     uint32_t campaign;
 };
 
-Candidate event_candidate(const std::array<Text, 7>& row, input::Window window,
-                          const Lookups& lookups) {
-    Candidate candidate{text_hash(row[0]), row[0], {}, 0, input::iso_time(row[3])};
+CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window window,
+                               const Lookups& lookups) {
+    CandidatePayload candidate{{}, 0, input::iso_time(row[3])};
     if (row[1].empty() || row[5].empty()) return candidate;
     const int64_t time = input::timestamp(row[2]);
     if (time < window.start || time >= window.end ||
@@ -245,33 +282,47 @@ Candidate event_candidate(const std::array<Text, 7>& row, input::Window window,
     return candidate;
 }
 
-// Candidates in a partition all share the low hash bits. Use the
-// remaining bits for linear probing, and compare IDs on hash matches.
-void deduplicate(std::vector<Shards<Candidate>>& lanes, size_t part,
+// Deduplicate the exact numeric and full-byte domains independently. In
+// each domain candidates in a partition share the low hash bits, so probe
+// with the remaining bits. A hash match in the byte domain requires equality
+// of the original ID. In the numeric domain the table stores the exact ID.
+template<class Row>
+void deduplicate(std::vector<Shards<Row>>& lanes, size_t part,
                  Shards<Event>& events, const LinkedIds& linked) {
+    constexpr bool packed = std::is_same_v<Row, PackedCandidate>;
     size_t count = 0;
     for (const auto& lane : lanes) count += lane[part].size();
     if (count == 0) return;
 
-    struct Entry { Candidate* winner = nullptr; uint64_t hash = 0; };
+    struct Entry { Row* winner = nullptr; uint64_t key = 0; };
     const size_t capacity = std::bit_ceil(count + count / 3 + 1);
     const size_t mask = capacity - 1;
     std::vector<Entry> table(capacity);
     for (auto& lane : lanes) {
-        for (Candidate& candidate : lane[part]) {
-            size_t slot = (candidate.id_hash / partitions) & mask;
+        for (Row& candidate : lane[part]) {
+            const uint64_t key = [](const Row& row) {
+                if constexpr (packed) return row.id;
+                else return row.id_hash;
+            }(candidate);
+            const uint64_t hash = packed ? packed_alias_hash(key) : key;
+            size_t slot = (hash / partitions) & mask;
             while (true) {
                 Entry& entry = table[slot];
                 if (!entry.winner) {
-                    entry = {&candidate, candidate.id_hash};
+                    entry = {&candidate, key};
                     break;
                 }
-                if (entry.hash == candidate.id_hash && entry.winner->id == candidate.id) {
-                    if (candidate.ingest < entry.winner->ingest) {
-                        entry.winner->user = {};
+                const bool matches = [&] {
+                    if (entry.key != key) return false;
+                    if constexpr (packed) return true;
+                    else return entry.winner->id == candidate.id;
+                }();
+                if (matches) {
+                    if (candidate.payload.ingest < entry.winner->payload.ingest) {
+                        entry.winner->payload.user = {};
                         entry.winner = &candidate;
                     } else {
-                        candidate.user = {};
+                        candidate.payload.user = {};
                     }
                     break;
                 }
@@ -280,15 +331,16 @@ void deduplicate(std::vector<Shards<Candidate>>& lanes, size_t part,
         }
     }
 
-    // Walk the original buffers in input order instead of gathering and
-    // sorting candidates or fetching the winners in hash-table order.
+    // Walk each domain's contiguous buffers instead of gathering and sorting
+    // candidates or fetching the winners in hash-table order.
     for (auto& lane : lanes) {
-        for (const Candidate& winner : lane[part]) {
+        for (const Row& row : lane[part]) {
+            const CandidatePayload& winner = row.payload;
             if (winner.user.empty()) continue;
             const ResolvedPerson person = linked.person(winner.user.text(), winner.user.packed());
             events[person.partition].push_back({person.key, winner.time, winner.price, winner.category});
         }
-        std::vector<Candidate>().swap(lane[part]);
+        std::vector<Row>().swap(lane[part]);
     }
 }
 
@@ -619,6 +671,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     // A capacity hint only. Vectors still grow normally for smaller rows or
     // uneven work distribution.
     const size_t candidate_hint = event_bytes / (64 * partitions * threads);
+    std::vector<Shards<PackedCandidate>> packed_candidate_lanes(threads);
     std::vector<Shards<Candidate>> candidate_lanes(threads);
     std::vector<Shards<Event>> event_lanes(threads);
     std::vector<Shards<Click>> click_lanes(threads);
@@ -640,19 +693,29 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
                         ready.get(), lookups, window);
             return;
         }
-        if (candidate_hint >= 1024 && candidate_lanes[lane][0].capacity() == 0) {
-            for (auto& candidates : candidate_lanes[lane]) candidates.reserve(candidate_hint);
+        if (candidate_hint >= 1024 && packed_candidate_lanes[lane][0].capacity() == 0) {
+            for (auto& candidates : packed_candidate_lanes[lane]) candidates.reserve(candidate_hint);
         }
         input::read<7>(event_chunks[job], [&](const auto& row) {
-            if (row[0].empty()) return;
-            auto candidate = event_candidate(row, window, lookups);
-            candidate_lanes[lane][shard(candidate.id_hash)].push_back(candidate);
+            const Text id = row[0];
+            if (id.empty()) return;
+
+            const uint64_t packed = pack_event_id(id);
+            const auto payload = event_payload(row, window, lookups);
+            if (packed != nonpacked_event_id) {
+                const size_t part = shard(packed_alias_hash(packed));
+                packed_candidate_lanes[lane][part].push_back({packed, payload});
+            } else {
+                const uint64_t hash = text_hash(id);
+                candidate_lanes[lane][shard(hash)].push_back({hash, id, payload});
+            }
         });
     });
     timer.mark("build links and parse events and clicks");
     const LinkedIds& linked = links_ready.get();
 
     parallel(partitions, threads, [&](size_t lane, size_t part) {
+        deduplicate(packed_candidate_lanes, part, event_lanes[lane], linked);
         deduplicate(candidate_lanes, part, event_lanes[lane], linked);
     });
     timer.mark("event dedup and routing");

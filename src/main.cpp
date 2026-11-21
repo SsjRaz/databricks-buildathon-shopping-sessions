@@ -210,11 +210,26 @@ public:
         if (other_ids.empty()) std::vector<size_t>().swap(canonical);
         std::vector<Node>().swap(nodes);
     }
-    ResolvedPerson person(uint64_t packed) const {
+    void prefetch_person(uint64_t alias) const {
+        if (alias != nonpacked_id && (alias & name_kind_mask) != raw_name_tag) {
+            packed_ids.prefetch(packed_alias_hash(alias));
+        }
+    }
+
+    uint64_t prefetch_packed_person(uint64_t packed) const {
         const uint64_t hash = packed_alias_hash(packed);
+        packed_ids.prefetch(hash);
+        return hash;
+    }
+
+    ResolvedPerson person(uint64_t packed, uint64_t hash) const {
         const uint64_t code = packed_ids.find(packed, hash);
         if (code != PackedAliasIndex::missing) return {PersonKey::from_link(code / partitions), shard(code)};
         return {PersonKey::from_packed(packed), shard(hash)};
+    }
+
+    ResolvedPerson person(uint64_t packed) const {
+        return person(packed, packed_alias_hash(packed));
     }
 
     ResolvedPerson person(Text id, uint64_t packed, std::vector<Text>& raw_names, size_t lane) const {
@@ -502,7 +517,11 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part,
             auto& charges = purchases[lane][part];
             size_t purchase = 0;
             size_t next = charges.empty() ? rows.size() : charges.front().position;
+            constexpr size_t prefetch_distance = 12;
             for (size_t index = 0; index < rows.size(); ++index) {
+                if (index + prefetch_distance < rows.size()) {
+                    linked.prefetch_person(rows[index + prefetch_distance].alias);
+                }
                 if (index == next) {
                     const auto& charge = charges[purchase++];
                     next = purchase == charges.size() ? rows.size() : charges[purchase].position;
@@ -530,11 +549,17 @@ void read_clicks(Text chunk, Shards<Click>& clicks, const LinkedIds& linked,
                  std::vector<Text>& raw_names, size_t worker) {
     input::read<4>(chunk, [&](const auto& row) {
         if (row[0].empty() || row[1].empty()) return;
+        // Start the packed alias lookup before validating the rest of the
+        // click, and reuse its hash if the click survives.
+        const uint64_t packed = pack_short_id(row[1]);
+        const uint64_t hash = packed != nonpacked_id ? linked.prefetch_packed_person(packed) : 0;
         const int64_t time = input::timestamp(row[3]);
         if (time < window.start - input::week_ms || time >= window.end) return;
         const auto campaign = lookups.campaigns.find(row[2]);
         if (campaign == lookups.campaigns.end()) return;
-        const ResolvedPerson person = linked.person(row[1], pack_short_id(row[1]), raw_names, worker);
+        const ResolvedPerson person = packed != nonpacked_id
+            ? linked.person(packed, hash)
+            : linked.person(row[1], nonpacked_id, raw_names, worker);
         clicks[person.partition].push_back({person.key, row[0], time, campaign->second});
     });
 }

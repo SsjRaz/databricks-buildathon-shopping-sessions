@@ -1,0 +1,10 @@
+/build/
+/dev/
+/dev-answer/
+/fixtures/
+/out/
+/scratch/
+*.zip
+*.csv
+*.parquet
+__pycache__/

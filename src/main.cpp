@@ -402,6 +402,44 @@ struct PackedCandidate {
 };
 static_assert(sizeof(PackedCandidate) == 24);
 
+// A parsing worker interleaves 128 output streams. Coalesce eight adjacent
+// 24-byte records into one ordinary cached copy per destination vector.
+// All pending rows belong to this input chunk and are committed before
+// another job can use its lane. Purchases index the same committed sequence.
+class PackedEventWriter {
+    static constexpr size_t batch_size = 8;
+    Shards<PackedCandidate>& destination;
+    alignas(64) std::array<std::array<PackedCandidate, batch_size>, partitions> pending;
+    std::array<uint8_t, partitions> counts{};
+
+public:
+    explicit PackedEventWriter(Shards<PackedCandidate>& shards) : destination(shards) {}
+
+    size_t next_position(size_t part) const {
+        return destination[part].size() + counts[part];
+    }
+
+    void append(size_t part, PackedCandidate row) {
+        auto& buffer = pending[part];
+        uint8_t& count = counts[part];
+        buffer[count++] = row;
+        if (count == batch_size) {
+            auto& out = destination[part];
+            out.insert(out.end(), buffer.begin(), buffer.end());
+            count = 0;
+        }
+    }
+
+    void finish() {
+        for (size_t part = 0; part < partitions; ++part) {
+            if (counts[part] == 0) continue;
+            auto& out = destination[part];
+            const auto first = pending[part].begin();
+            out.insert(out.end(), first, first + counts[part]);
+        }
+    }
+};
+
 uint64_t pack_candidate_times(const CandidatePayload& payload, TimeOrigins origin,
                               std::deque<WideCandidateTimes>& overflow) {
     // Invalid events still enter dedup with their original ingest. Their
@@ -1325,6 +1363,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         if (candidate_hint >= 1024 && packed_candidate_lanes[lane][0].capacity() == 0) {
             for (auto& candidates : packed_candidate_lanes[lane]) candidates.reserve(candidate_hint);
         }
+        PackedEventWriter packed_output(packed_candidate_lanes[lane]);
         input::read_events(event_chunks[job], [&](const auto& row) {
             const Text id = row[0];
             if (id.empty()) return;
@@ -1333,19 +1372,19 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
             const auto payload = event_payload(row, window, lookups);
             if (packed != nonpacked_id) {
                 const size_t part = shard(packed_alias_hash(packed));
-                auto& candidates = packed_candidate_lanes[lane][part];
                 if (payload.price != 0) {
                     packed_purchase_lanes[lane][part].push_back(
-                        {candidates.size(), payload.price, payload.category});
+                        {packed_output.next_position(part), payload.price, payload.category});
                 }
                 const uint64_t times = pack_candidate_times(payload, time_origin, wide_candidate_times[lane]);
                 const uint64_t alias = pack_candidate_alias(payload.user, raw_candidate_names[lane]);
-                candidates.push_back({packed, alias, times});
+                packed_output.append(part, {packed, alias, times});
             } else {
                 const uint64_t hash = text_hash(id);
                 candidate_lanes[lane][shard(hash)].push_back({hash, id, payload});
             }
         });
+        packed_output.finish();
     });
     timer.mark("build links and parse events and clicks");
     const LinkedIds& linked = *linked_ids;

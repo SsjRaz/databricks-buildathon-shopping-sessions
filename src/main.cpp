@@ -734,7 +734,11 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     timer.mark("build links and parse events and clicks");
     const LinkedIds& linked = links_ready.get();
 
+    const size_t event_hint = event_bytes / (72 * partitions * threads);
     parallel(partitions, threads, [&](size_t lane, size_t part) {
+        if (event_hint >= 1024 && event_lanes[lane][0].capacity() == 0) {
+            for (auto& events : event_lanes[lane]) events.reserve(event_hint);
+        }
         deduplicate(packed_candidate_lanes, part, event_lanes[lane], linked);
         deduplicate(candidate_lanes, part, event_lanes[lane], linked);
     });

@@ -73,13 +73,16 @@ class LinkedIds {
         uint32_t parent, size;
     };
     std::vector<Node> nodes;
-    StringIndex ids;
+    PackedAliasIndex packed_ids;
+    StringIndex other_ids;
     std::vector<size_t> canonical;
     std::array<std::vector<Text>, partitions> names_by_partition;
 
     uint32_t index(Text id) {
-        const uint64_t hash = text_hash(id);
-        const auto [i, inserted] = ids.try_add(id, hash, nodes.size());
+        const uint64_t packed = pack_alias(id);
+        const auto [i, inserted] = packed == nonpacked_alias
+            ? other_ids.try_add(id, text_hash(id), nodes.size())
+            : packed_ids.try_add(packed, nodes.size());
         if (inserted) nodes.push_back({id, i, 1});
         return i;
     }
@@ -108,7 +111,7 @@ class LinkedIds {
     }
 
 public:
-    explicit LinkedIds(const std::vector<input::Mapping>& links) : ids(estimate_ids(links)) {
+    explicit LinkedIds(const std::vector<input::Mapping>& links) : packed_ids(estimate_ids(links)) {
         nodes.reserve(estimate_ids(links));
         for (const auto& file : links) {
             input::lookup<2>(file, [&](const auto& row) {
@@ -125,11 +128,19 @@ public:
             names.push_back(name);
         }
         for (uint32_t i = 0; i < nodes.size(); ++i) canonical[i] = canonical[root(i)];
+        packed_ids.resolve(canonical);
+        if (other_ids.empty()) std::vector<size_t>().swap(canonical);
         std::vector<Node>().swap(nodes);
     }
     ResolvedPerson person(Text id) const {
+        const uint64_t packed = pack_alias(id);
+        if (packed != nonpacked_alias) {
+            const uint64_t code = packed_ids.find(packed);
+            if (code != PackedAliasIndex::missing) return {{nullptr, code / partitions}, shard(code)};
+            return {{id.data(), id.size()}, shard(text_hash(id))};
+        }
         const uint64_t hash = text_hash(id);
-        const uint32_t index = ids.find(id, hash);
+        const uint32_t index = other_ids.find(id, hash);
         if (index == StringIndex::missing) return {{id.data(), id.size()}, shard(hash)};
         const size_t code = canonical[index];
         return {{nullptr, code / partitions}, shard(code)};

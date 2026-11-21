@@ -1325,7 +1325,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         if (candidate_hint >= 1024 && packed_candidate_lanes[lane][0].capacity() == 0) {
             for (auto& candidates : packed_candidate_lanes[lane]) candidates.reserve(candidate_hint);
         }
-        input::read<7>(event_chunks[job], [&](const auto& row) {
+        input::read_events(event_chunks[job], [&](const auto& row) {
             const Text id = row[0];
             if (id.empty()) return;
 

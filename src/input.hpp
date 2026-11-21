@@ -201,6 +201,112 @@ void read(Text bytes, Fn&& fn) {
 #endif
 }
 
+#if defined(__AVX2__) && defined(__BMI2__)
+struct EventDelimiters {
+    uint32_t comma, quote, newline;
+};
+
+inline EventDelimiters event_delimiters(const char* data) {
+    const auto block = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
+    const auto match = [&](char byte) {
+        return static_cast<uint32_t>(_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(block, _mm256_set1_epi8(byte))));
+    };
+    return {match(','), match('"'), match('\n')};
+}
+
+inline uint64_t low_bits(unsigned length) {
+    return length >= 64 ? UINT64_MAX : (uint64_t{1} << length) - 1;
+}
+
+// A seven-field shape with two short IDs followed by a timestamp has three
+// separators in disjoint bands, including independent quotes around any field.
+// Six total commas and three trailing commas certify all inferred positions.
+template<class Fn>
+bool shaped_event_row(const char* row, unsigned length, uint64_t commas, uint64_t tail_commas,
+                      uint64_t quotes, uint64_t tail_quotes, Fn& fn) {
+    const uint64_t first = commas & (uint64_t{0xf} << 8);
+    const uint64_t second = commas & (uint64_t{0x7f} << 17);
+    const uint64_t third = commas & (uint64_t{0x1fffff} << 31);
+    uint64_t rest = (commas >> 52) | (tail_commas << 12);
+    if (!first || !second || !third || std::popcount(rest) != 3 ||
+        std::popcount(commas) + std::popcount(tail_commas) != 6) return false;
+
+    unsigned trim = 0;
+    if (quotes || tail_quotes) {
+        const uint64_t ends = commas | (length < 64 ? uint64_t{1} << length : 0);
+        const uint64_t tail_ends = tail_commas | (length >= 64 ? uint64_t{1} << (length - 64) : 0);
+        const uint64_t starts = (commas << 1) | 1;
+        const uint64_t tail_starts = (tail_commas << 1) | (commas >> 63);
+        const uint64_t closes = (ends >> 1) | (tail_ends << 63);
+        const uint64_t tail_closes = tail_ends >> 1;
+        if ((quotes & ~(starts | closes)) || (tail_quotes & ~(tail_starts | tail_closes))) return true;
+        const auto field_bits = [&](uint64_t lo, uint64_t hi) -> unsigned {
+            return static_cast<unsigned>(_pext_u64(quotes, lo) |
+                (_pext_u64(tail_quotes, hi) << std::popcount(lo)));
+        };
+        trim = field_bits(starts, tail_starts);
+        if (trim != field_bits(closes, tail_closes) ||
+            std::popcount(quotes) + std::popcount(tail_quotes) != 2 * std::popcount(trim)) return true;
+    }
+
+    const unsigned c0 = std::countr_zero(first);
+    const unsigned c1 = std::countr_zero(second);
+    const unsigned c2 = std::countr_zero(third);
+    const unsigned c3 = 52 + std::countr_zero(rest);
+    rest &= rest - 1;
+    const unsigned c4 = 52 + std::countr_zero(rest);
+    rest &= rest - 1;
+    const unsigned c5 = 52 + std::countr_zero(rest);
+    const auto slice = [&](unsigned i, unsigned begin, unsigned end) {
+        const unsigned q = (trim >> i) & 1;
+        return Text(row + begin + q, end - begin - 2*q);
+    };
+    const std::array<Text, 7> record{{
+        slice(0, 0, c0), slice(1, c0+1, c1), slice(2, c1+1, c2),
+        slice(3, c2+1, c3), slice(4, c3+1, c4), slice(5, c4+1, c5), slice(6, c5+1, length)
+    }};
+    fn(record);
+    return true;
+}
+#endif
+
+template<class Fn>
+void read_events(Text bytes, Fn&& fn) {
+#if defined(__AVX2__) && defined(__BMI2__)
+    while (bytes.size() >= 96) {
+        const char* row = bytes.data();
+        const auto a = event_delimiters(row);
+        const auto b = event_delimiters(row+32);
+        const auto c = event_delimiters(row+64);
+        const uint64_t lf = a.newline | (uint64_t{b.newline} << 32);
+        size_t length;
+        if (lf || c.newline) {
+            const unsigned n = lf ? std::countr_zero(lf) : 64 + std::countr_zero(c.newline);
+            const auto low = low_bits(n);
+            const auto high = n > 64 ? low_bits(n - 64) : 0;
+            const auto join = [](uint32_t first, uint32_t second) {
+                return first | (uint64_t{second} << 32);
+            };
+            if (shaped_event_row(row, n, join(a.comma, b.comma) & low, c.comma & high,
+                                 join(a.quote, b.quote) & low, c.quote & high, fn)) {
+                bytes.remove_prefix(n+1);
+                continue;
+            }
+            length = n;
+        } else {
+            const char* last = find_byte(row + 96, row + bytes.size(), '\n');
+            length = static_cast<size_t>(last - row);
+        }
+        std::array<Text, 7> record;
+        if (fields(Text(row, length), record)) fn(record);
+        if (length == bytes.size()) return;
+        bytes.remove_prefix(length+1);
+    }
+#endif
+    read<7>(bytes, std::forward<Fn>(fn));
+}
+
 template<size_t Count, class Fn>
 void lookup(const Mapping& file, Fn&& fn) {
     const auto bytes = file.bytes();

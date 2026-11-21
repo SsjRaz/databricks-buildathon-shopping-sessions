@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -50,23 +51,36 @@ void parallel(size_t jobs, size_t threads, Fn&& fn) {
     if (error) std::rethrow_exception(error);
 }
 
-struct Person {
-    Text name;
-    uint64_t hash;
+// A linked person has a stable ordinal within their output partition.
+// Unlinked IDs keep a view of their original bytes for exact comparison.
+struct PersonKey {
+    const char* bytes;
+    size_t length_or_ordinal;
+
+    bool linked() const { return bytes == nullptr; }
+    size_t ordinal() const { return length_or_ordinal; }
+    Text unlinked_name() const { return {bytes, length_or_ordinal}; }
+};
+
+struct ResolvedPerson {
+    PersonKey key;
+    size_t partition;
 };
 
 class LinkedIds {
     struct Node {
-        Person person;
+        Text name;
         uint32_t parent, size;
     };
     std::vector<Node> nodes;
     StringIndex ids;
+    std::vector<size_t> canonical;
+    std::array<std::vector<Text>, partitions> names_by_partition;
 
     uint32_t index(Text id) {
         const uint64_t hash = text_hash(id);
         const auto [i, inserted] = ids.try_add(id, hash, nodes.size());
-        if (inserted) nodes.push_back({{id, hash}, i, 1});
+        if (inserted) nodes.push_back({id, i, 1});
         return i;
     }
     uint32_t root(uint32_t i) {
@@ -82,9 +96,7 @@ class LinkedIds {
         if (nodes[first].size < nodes[second].size) std::swap(first, second);
         nodes[second].parent = first;
         nodes[first].size += nodes[second].size;
-        if (nodes[second].person.name < nodes[first].person.name) {
-            nodes[first].person = nodes[second].person;
-        }
+        nodes[first].name = std::min(nodes[first].name, nodes[second].name);
     }
 
     static size_t estimate_ids(const std::vector<input::Mapping>& links) {
@@ -103,13 +115,27 @@ public:
                 if (!row[0].empty() && !row[1].empty()) join(row[0], row[1]);
             });
         }
-        for (uint32_t i = 0; i < nodes.size(); ++i) nodes[i].parent = root(i);
-        for (Node& node : nodes) node.person = nodes[node.parent].person;
+        canonical.resize(nodes.size());
+        for (uint32_t i = 0; i < nodes.size(); ++i) {
+            if (nodes[i].parent != i) continue;
+            const Text name = nodes[i].name;
+            const size_t part = shard(text_hash(name));
+            auto& names = names_by_partition[part];
+            canonical[i] = names.size() * partitions + part;
+            names.push_back(name);
+        }
+        for (uint32_t i = 0; i < nodes.size(); ++i) canonical[i] = canonical[root(i)];
+        std::vector<Node>().swap(nodes);
     }
-    Person person(Text id) const {
+    ResolvedPerson person(Text id) const {
         const uint64_t hash = text_hash(id);
         const uint32_t index = ids.find(id, hash);
-        return index == StringIndex::missing ? Person{id, hash} : nodes[index].person;
+        if (index == StringIndex::missing) return {{id.data(), id.size()}, shard(hash)};
+        const size_t code = canonical[index];
+        return {{nullptr, code / partitions}, shard(code)};
+    }
+    std::span<const Text> names(size_t partition) const {
+        return names_by_partition[partition];
     }
 };
 
@@ -151,13 +177,14 @@ struct Candidate {
 };
 
 struct Event {
-    Text person;
+    PersonKey person;
     int64_t time;
     uint32_t price, category;
 };
 
 struct Click {
-    Text person, id;
+    PersonKey person;
+    Text id;
     int64_t time;
     uint32_t campaign;
 };
@@ -225,8 +252,8 @@ void deduplicate(std::vector<Shards<Candidate>>& lanes, size_t part,
     for (auto& lane : lanes) {
         for (const Candidate& winner : lane[part]) {
             if (winner.user.empty()) continue;
-            const Person person = linked.person(winner.user);
-            events[shard(person.hash)].push_back({person.name, winner.time, winner.price, winner.category});
+            const ResolvedPerson person = linked.person(winner.user);
+            events[person.partition].push_back({person.key, winner.time, winner.price, winner.category});
         }
         std::vector<Candidate>().swap(lane[part]);
     }
@@ -240,8 +267,8 @@ void read_clicks(Text chunk, Shards<Click>& clicks, const LinkedIds& linked,
         if (time < window.start - input::week_ms || time >= window.end) return;
         const auto campaign = lookups.campaigns.find(row[2]);
         if (campaign == lookups.campaigns.end()) return;
-        const Person person = linked.person(row[1]);
-        clicks[shard(person.hash)].push_back({person.name, row[0], time, campaign->second});
+        const ResolvedPerson person = linked.person(row[1]);
+        clicks[person.partition].push_back({person.key, row[0], time, campaign->second});
     });
 }
 
@@ -270,30 +297,46 @@ struct GroupedPartition {
 // Bucket into contiguous per-person ranges, then sort only the timestamps
 // within each range. Clicks for people without surviving events are discarded.
 GroupedPartition group_people(std::vector<Shards<Event>>& event_lanes,
-                              std::vector<Shards<Click>>& click_lanes, size_t part) {
+                              std::vector<Shards<Click>>& click_lanes, size_t part,
+                              std::span<const Text> linked_names) {
     size_t event_count = 0, click_count = 0;
     for (const auto& lane : event_lanes) event_count += lane[part].size();
     for (const auto& lane : click_lanes) click_count += lane[part].size();
     GroupedPartition result;
     if (event_count == 0) return result;
 
-    StringIndex index(event_count / 16);
+    StringIndex index(event_count / 32);
+    std::vector<uint32_t> linked_groups(linked_names.size(), StringIndex::missing);
     std::vector<uint32_t> event_person;
     std::vector<uint32_t> click_person;
     event_person.reserve(event_count);
     click_person.reserve(click_count);
     for (const auto& lane : event_lanes) {
         for (const Event& event : lane[part]) {
-            const auto [id, inserted] =
-                index.try_add(event.person, text_hash(event.person), result.people.size());
-            if (inserted) result.people.push_back({event.person});
+            const PersonKey person = event.person;
+            uint32_t id;
+            if (person.linked()) {
+                auto& group = linked_groups[person.ordinal()];
+                if (group == StringIndex::missing) {
+                    group = result.people.size();
+                    result.people.push_back({linked_names[person.ordinal()]});
+                }
+                id = group;
+            } else {
+                const Text name = person.unlinked_name();
+                const auto [group, inserted] = index.try_add(name, text_hash(name), result.people.size());
+                if (inserted) result.people.push_back({name});
+                id = group;
+            }
             ++result.people[id].event_end;
             event_person.push_back(id);
         }
     }
     for (const auto& lane : click_lanes) {
         for (const Click& click : lane[part]) {
-            const uint32_t id = index.find(click.person, text_hash(click.person));
+            const PersonKey person = click.person;
+            const uint32_t id = person.linked() ? linked_groups[person.ordinal()]
+                : index.find(person.unlinked_name(), text_hash(person.unlinked_name()));
             if (id != StringIndex::missing) ++result.people[id].click_end;
             click_person.push_back(id);
         }
@@ -532,8 +575,9 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     const auto click_files = input::map_parts(data / "clicks");
     const auto window = input::parse_window(manifest.bytes());
     const Lookups lookups(products, campaigns);
-    const LinkedIds linked(link_files);
-    timer.mark("lookups and links");
+    timer.mark("lookups");
+    std::promise<LinkedIds> build_links;
+    const auto links_ready = build_links.get_future().share();
 
     const auto event_chunks = input::chunks(event_files, chunk_size);
     const auto click_chunks = input::chunks(click_files, chunk_size);
@@ -546,9 +590,21 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     std::vector<Shards<Event>> event_lanes(threads);
     std::vector<Shards<Click>> click_lanes(threads);
 
-    parallel(event_chunks.size() + click_chunks.size(), threads, [&](size_t lane, size_t job) {
+    parallel(1 + event_chunks.size() + click_chunks.size(), threads, [&](size_t lane, size_t job) {
+        if (job == 0) {
+            try {
+                build_links.set_value(LinkedIds(link_files));
+            } catch (...) {
+                build_links.set_exception(std::current_exception());
+                throw;
+            }
+            return;
+        }
+        --job;
         if (job >= event_chunks.size()) {
-            read_clicks(click_chunks[job - event_chunks.size()], click_lanes[lane], linked, lookups, window);
+            const auto ready = links_ready;
+            read_clicks(click_chunks[job - event_chunks.size()], click_lanes[lane],
+                        ready.get(), lookups, window);
             return;
         }
         if (candidate_hint >= 1024 && candidate_lanes[lane][0].capacity() == 0) {
@@ -560,7 +616,8 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
             candidate_lanes[lane][shard(candidate.id_hash)].push_back(candidate);
         });
     });
-    timer.mark("parse events and clicks");
+    timer.mark("build links and parse events and clicks");
+    const LinkedIds& linked = links_ready.get();
 
     parallel(partitions, threads, [&](size_t lane, size_t part) {
         deduplicate(candidate_lanes, part, event_lanes[lane], linked);
@@ -570,7 +627,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     Shards<UserDay> user_rows;
     std::array<CampaignTotals, partitions> campaign_totals;
     parallel(partitions, threads, [&](size_t, size_t part) {
-        auto grouped = group_people(event_lanes, click_lanes, part);
+        auto grouped = group_people(event_lanes, click_lanes, part, linked.names(part));
         summarize(grouped, lookups, user_rows[part], campaign_totals[part]);
     });
     timer.mark("sort, sessionize and attribute");

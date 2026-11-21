@@ -100,6 +100,11 @@ inline uint64_t pack_alias(std::string_view key) {
 #endif
 }
 
+inline uint64_t packed_alias_hash(uint64_t key) {
+    const uint64_t mixed = (key ^ (key >> 29)) * 0x9e3779b97f4a7c15ULL;
+    return mixed ^ (mixed >> 32);
+}
+
 // Packed alias lookups use one 16-byte slot for the exact ID and its canonical
 // code. The value is a union-find node index until resolve() maps it in place.
 class PackedAliasIndex {
@@ -117,10 +122,9 @@ private:
     size_t initial_capacity;
     size_t used = 0;
 
-    size_t locate(uint64_t key) const {
+    size_t locate(uint64_t key, uint64_t hash) const {
         const size_t mask = slots.size() - 1;
-        const uint64_t mixed = (key ^ (key >> 29)) * 0x9e3779b97f4a7c15ULL;
-        size_t i = (mixed ^ (mixed >> 32)) & mask;
+        size_t i = hash & mask;
         while (slots[i].value != missing && slots[i].key != key) i = (i + 1) & mask;
         return i;
     }
@@ -129,7 +133,7 @@ private:
         auto old = std::move(slots);
         slots.resize(old.size() * 2);
         for (const Slot& entry : old) {
-            if (entry.value != missing) slots[locate(entry.key)] = entry;
+            if (entry.value != missing) slots[locate(entry.key, packed_alias_hash(entry.key))] = entry;
         }
     }
 
@@ -137,19 +141,20 @@ public:
     explicit PackedAliasIndex(size_t expected)
         : initial_capacity(std::bit_ceil(std::max<size_t>(16, expected + expected / 2))) {}
 
-    uint64_t find(uint64_t key) const {
+    uint64_t find(uint64_t key, uint64_t hash) const {
         if (slots.empty()) return missing;
-        return slots[locate(key)].value;
+        return slots[locate(key, hash)].value;
     }
 
     std::pair<uint32_t, bool> try_add(uint64_t key, uint32_t index) {
         if (index == StringIndex::missing) throw std::logic_error("invalid alias index entry");
         if (slots.empty()) slots.resize(initial_capacity);
-        size_t i = locate(key);
+        const uint64_t hash = packed_alias_hash(key);
+        size_t i = locate(key, hash);
         if (slots[i].value != missing) return {static_cast<uint32_t>(slots[i].value), false};
         if (used + 1 > slots.size() * 2 / 3) {
             grow();
-            i = locate(key);
+            i = locate(key, hash);
         }
         slots[i] = {key, index};
         ++used;

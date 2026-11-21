@@ -132,12 +132,12 @@ public:
         if (other_ids.empty()) std::vector<size_t>().swap(canonical);
         std::vector<Node>().swap(nodes);
     }
-    ResolvedPerson person(Text id) const {
-        const uint64_t packed = pack_alias(id);
+    ResolvedPerson person(Text id, uint64_t packed) const {
         if (packed != nonpacked_alias) {
-            const uint64_t code = packed_ids.find(packed);
+            const uint64_t hash = packed_alias_hash(packed);
+            const uint64_t code = packed_ids.find(packed, hash);
             if (code != PackedAliasIndex::missing) return {{nullptr, code / partitions}, shard(code)};
-            return {{id.data(), id.size()}, shard(text_hash(id))};
+            return {{id.data(), id.size()}, shard(hash)};
         }
         const uint64_t hash = text_hash(id);
         const uint32_t index = other_ids.find(id, hash);
@@ -145,6 +145,8 @@ public:
         const size_t code = canonical[index];
         return {{nullptr, code / partitions}, shard(code)};
     }
+    ResolvedPerson person(Text id) const { return person(id, pack_alias(id)); }
+
     std::span<const Text> names(size_t partition) const {
         return names_by_partition[partition];
     }
@@ -176,11 +178,31 @@ struct Lookups {
     }
 };
 
+// Pack short user IDs while the CSV bytes are hot. Keep the original
+// pointer for unlinked and nonpacked IDs, and keep full lengths for fallbacks.
+struct ParsedAlias {
+    const char* bytes = nullptr;
+    uint64_t key_or_length = nonpacked_alias;
+
+    ParsedAlias() = default;
+    explicit ParsedAlias(Text id) : bytes(id.data()), key_or_length(pack_alias(id)) {
+        if (key_or_length == nonpacked_alias) key_or_length |= id.size();
+    }
+
+    bool empty() const { return bytes == nullptr; }
+    uint64_t packed() const { return key_or_length & nonpacked_alias ? nonpacked_alias : key_or_length; }
+    Text text() const {
+        return {bytes, key_or_length & nonpacked_alias ? key_or_length & ~nonpacked_alias : 9};
+    }
+};
+static_assert(sizeof(ParsedAlias) == sizeof(Text));
+
 // Keep invalid candidates through deduplication. An empty user marks a record
 // that must be discarded only if it is the earliest copy.
 struct Candidate {
     uint64_t id_hash;
-    Text id, user;
+    Text id;
+    ParsedAlias user;
     int64_t time = 0;
     int64_t ingest;
     uint32_t price = 0;
@@ -218,7 +240,7 @@ Candidate event_candidate(const std::array<Text, 7>& row, input::Window window,
     } else if (row[4] != "view" && row[4] != "cart") {
         return candidate;
     }
-    candidate.user = row[1];
+    candidate.user = ParsedAlias(row[1]);
     candidate.time = time;
     return candidate;
 }
@@ -263,7 +285,7 @@ void deduplicate(std::vector<Shards<Candidate>>& lanes, size_t part,
     for (auto& lane : lanes) {
         for (const Candidate& winner : lane[part]) {
             if (winner.user.empty()) continue;
-            const ResolvedPerson person = linked.person(winner.user);
+            const ResolvedPerson person = linked.person(winner.user.text(), winner.user.packed());
             events[person.partition].push_back({person.key, winner.time, winner.price, winner.category});
         }
         std::vector<Candidate>().swap(lane[part]);

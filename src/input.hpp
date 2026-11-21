@@ -8,7 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
-#ifdef __AVX2__
+#if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>
 #endif
 #include <limits>
@@ -265,6 +265,31 @@ inline int32_t calendar_day(const char* p) {
     }
     entry = {prefix, suffix, result};
     return result;
+}
+
+inline constexpr uint32_t invalid_clock = UINT32_MAX;
+
+// Ordered HHMMSS digits in 24 bits, for comparisons without computing seconds.
+inline uint32_t clock_bcd(const char* p) {
+    uint64_t bytes;
+    std::memcpy(&bytes, p, sizeof(bytes));
+    constexpr uint64_t digits = 0x0f0f000f0f000f0fULL;
+    constexpr uint64_t shape = 0x30303a30303a3030ULL;
+    constexpr uint64_t add_six = 0x0606000606000606ULL;
+    if ((bytes & ~digits) != shape || ((bytes + add_six) & ~digits) != shape) return invalid_clock;
+#ifdef __BMI2__
+    const auto bcd = static_cast<uint32_t>(_pext_u64(__builtin_bswap64(bytes), digits));
+#else
+    const auto pair_bcd = [](const char* pair) -> uint32_t { return ((pair[0] & 15) << 4) | (pair[1] & 15); };
+    const uint32_t bcd = (pair_bcd(p) << 16) | (pair_bcd(p + 3) << 8) | pair_bcd(p + 6);
+#endif
+    if (bcd >= 0x240000 || (bcd & 0xff00) >= 0x6000 || (bcd & 0xff) >= 0x60) return invalid_clock;
+    return bcd;
+}
+
+inline int64_t clock_bcd_ms(uint32_t bcd) {
+    const auto pair_value = [](uint32_t digits) { return ((digits >> 4) & 15) * 10 + (digits & 15); };
+    return ((pair_value(bcd >> 16) * 60 + pair_value(bcd >> 8)) * 60 + pair_value(bcd)) * int64_t{1000};
 }
 
 inline int64_t iso_time(Text text) {

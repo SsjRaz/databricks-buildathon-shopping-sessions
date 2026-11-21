@@ -360,15 +360,56 @@ uint64_t pack_parsed_alias(const ParsedAlias& alias) {
 struct CandidatePayload {
     ParsedAlias user;
     int64_t time = 0;
-    int64_t ingest;
     uint32_t price = 0;
     uint32_t category = 0;
 };
 
 struct TimeOrigins {
     int64_t event_ms;
-    int64_t ingest_seconds;
+    int64_t ingest_day;
 };
+
+bool event_too_late(int64_t ingest, int64_t time) {
+    return ingest > time &&
+           static_cast<uint64_t>(ingest) - static_cast<uint64_t>(time) > input::day_ms;
+}
+
+struct PackedIngest {
+    static constexpr uint32_t full_width = UINT32_MAX;
+    static constexpr unsigned clock_bits = 24;
+    static constexpr uint32_t clock_mask = (uint32_t{1} << clock_bits) - 1;
+    static constexpr uint64_t day_limit = 128;
+    static constexpr int64_t day_bias = 16;
+
+    uint32_t order;
+    int64_t day_start_or_time; // Midnight for an ordered key, exact timestamp for the fallback.
+
+    int64_t milliseconds() const {
+        if (order == full_width) return day_start_or_time;
+        return day_start_or_time + input::clock_bcd_ms(order & clock_mask);
+    }
+
+    bool too_late(int64_t event_time) const {
+        // No valid ingest time in this day is over a day past its midnight.
+        if (order != full_width && event_time >= day_start_or_time) return false;
+        return event_too_late(milliseconds(), event_time);
+    }
+};
+
+PackedIngest read_packed_ingest(Text text, TimeOrigins origin) {
+    if (text.size() == 20 && text[10] == 'T' && text[19] == 'Z') {
+        const uint32_t clock = input::clock_bcd(text.data() + 11);
+        if (clock != input::invalid_clock) {
+            const int32_t day = input::calendar_day(text.data());
+            const auto biased = static_cast<uint64_t>(day - origin.ingest_day + PackedIngest::day_bias);
+            if (day != input::invalid_day && biased < PackedIngest::day_limit) {
+                const auto order = (static_cast<uint32_t>(biased) << PackedIngest::clock_bits) | clock;
+                return {order, day * input::day_ms};
+            }
+        }
+    }
+    return {PackedIngest::full_width, input::iso_time(text)};
+}
 
 struct WideCandidateTimes {
     int64_t event_ms;
@@ -376,12 +417,11 @@ struct WideCandidateTimes {
 };
 static_assert(alignof(WideCandidateTimes) >= 2);
 
-// Store unsigned relative event milliseconds below the biased signed ingest
-// seconds. The top bit distinguishes an exact full-width fallback.
+// Store relative event milliseconds below the ordered ingest day/clock key.
+// The top bit distinguishes an exact full-width fallback.
 struct PackedCandidate {
     static constexpr uint64_t wide = uint64_t{1} << 63;
     static constexpr uint64_t invalid_alias = UINT64_MAX;
-    static constexpr int64_t ingest_bias = int64_t{1} << 30;
 
     uint64_t id;
     uint64_t alias;
@@ -394,8 +434,9 @@ struct PackedCandidate {
 
     int64_t ingest_time(TimeOrigins origin) const {
         if (times & wide) return wide_times().ingest_ms;
-        const int64_t delta = static_cast<int64_t>(times >> 32) - ingest_bias;
-        return (origin.ingest_seconds + delta) * 1000;
+        const auto order = static_cast<uint32_t>(times >> 32);
+        const int64_t day = origin.ingest_day + (order >> PackedIngest::clock_bits) - PackedIngest::day_bias;
+        return day * input::day_ms + input::clock_bcd_ms(order & PackedIngest::clock_mask);
     }
 
     bool earlier_than(const PackedCandidate& other, TimeOrigins origin) const {
@@ -409,24 +450,20 @@ struct PackedCandidate {
 };
 static_assert(sizeof(PackedCandidate) == 24);
 
-uint64_t pack_candidate_times(const CandidatePayload& payload, TimeOrigins origin,
+uint64_t pack_candidate_times(const CandidatePayload& payload, PackedIngest ingest, TimeOrigins origin,
                               std::deque<WideCandidateTimes>& overflow) {
     // Invalid events still enter dedup with their original ingest. Their
     // event time is never consumed because their user is empty.
     const uint64_t event_delta = payload.user.empty() ? 0 :
         static_cast<uint64_t>(payload.time) - static_cast<uint64_t>(origin.event_ms);
-    const int64_t ingest_delta = payload.ingest / 1000 - origin.ingest_seconds;
-
-    if (event_delta <= UINT32_MAX && payload.ingest % 1000 == 0 &&
-        ingest_delta >= -PackedCandidate::ingest_bias && ingest_delta < PackedCandidate::ingest_bias) {
-        const auto biased = static_cast<uint64_t>(ingest_delta + PackedCandidate::ingest_bias);
-        return (biased << 32) | event_delta;
+    if (event_delta <= UINT32_MAX && ingest.order != PackedIngest::full_width) {
+        return (uint64_t{ingest.order} << 32) | event_delta;
     }
 
     // A deque preserves the addresses of existing elements during appends.
     // Alignment leaves the pointer's low bit zero. Shift it away to make
     // room for the wide marker without restricting the address range.
-    overflow.push_back({payload.time, payload.ingest});
+    overflow.push_back({payload.time, ingest.milliseconds()});
     const auto pointer = reinterpret_cast<uintptr_t>(&overflow.back());
     return PackedCandidate::wide | (static_cast<uint64_t>(pointer) >> 1);
 }
@@ -454,6 +491,7 @@ struct Candidate {
     uint64_t id_hash;
     Text id;
     CandidatePayload payload;
+    int64_t ingest;
 };
 
 struct TimedEvent {
@@ -538,16 +576,13 @@ TimedClick make_timed_click(Text id, int64_t time, uint32_t campaign, std::deque
     return {{.full = &wide_ids.back()}, time, campaign, TimedClick::wide_id};
 }
 
+template<class TooLate>
 CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window window,
-                               const Lookups& lookups) {
-    CandidatePayload candidate{{}, 0, input::iso_time(row[3])};
+                               const Lookups& lookups, TooLate&& too_late) {
+    CandidatePayload candidate;
     if (row[1].empty() || row[5].empty()) return candidate;
     const int64_t time = input::timestamp(row[2]);
-    if (time < window.start || time >= window.end ||
-        (candidate.ingest > time && static_cast<uint64_t>(candidate.ingest) -
-             static_cast<uint64_t>(time) > input::day_ms)) {
-        return candidate;
-    }
+    if (time < window.start || time >= window.end || too_late(time)) return candidate;
     if (row[4] == "purchase") {
         const uint64_t price = input::decimal(row[6], 10000000);
         if (price == 0 || price == UINT64_MAX) return candidate;
@@ -573,7 +608,7 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<Time
     constexpr bool packed = std::is_same_v<Row, PackedCandidate>;
     const auto earlier = [&](const Row& candidate, const Row& winner) {
         if constexpr (packed) return candidate.earlier_than(winner, origin);
-        else return candidate.payload.ingest < winner.payload.ingest;
+        else return candidate.ingest < winner.ingest;
     };
     const auto discard = [](Row& row) {
         if constexpr (packed) row.alias = PackedCandidate::invalid_alias;
@@ -1308,7 +1343,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     // A capacity hint only. Vectors still grow normally for smaller rows or
     // uneven work distribution.
     const size_t candidate_hint = event_bytes / (64 * partitions * threads);
-    const TimeOrigins time_origin{window.start, window.start / 1000};
+    const TimeOrigins time_origin{window.start, utc_day_number(window.start)};
     std::vector<std::deque<WideCandidateTimes>> wide_candidate_times(threads);
     RawNameLanes raw_candidate_names(threads);
     std::vector<Shards<PackedCandidate>> packed_candidate_lanes(threads);
@@ -1337,20 +1372,25 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
             if (id.empty()) return;
 
             const uint64_t packed = pack_short_id(id);
-            const auto payload = event_payload(row, window, lookups);
             if (packed != nonpacked_id) {
+                const auto ingest = read_packed_ingest(row[3], time_origin);
+                const auto payload = event_payload(row, window, lookups,
+                                                   [&](int64_t time) { return ingest.too_late(time); });
                 const size_t part = shard(packed_alias_hash(packed));
                 auto& candidates = packed_candidate_lanes[lane][part];
                 if (payload.price != 0) {
                     packed_purchase_lanes[lane][part].push_back(
                         {candidates.size(), payload.price, payload.category});
                 }
-                const uint64_t times = pack_candidate_times(payload, time_origin, wide_candidate_times[lane]);
+                const uint64_t times = pack_candidate_times(payload, ingest, time_origin, wide_candidate_times[lane]);
                 const uint64_t alias = pack_candidate_alias(payload.user, raw_candidate_names[lane]);
                 candidates.push_back({packed, alias, times});
             } else {
+                const int64_t ingest = input::iso_time(row[3]);
+                const auto payload = event_payload(row, window, lookups,
+                                                   [&](int64_t time) { return event_too_late(ingest, time); });
                 const uint64_t hash = text_hash(id);
-                candidate_lanes[lane][shard(hash)].push_back({hash, id, payload});
+                candidate_lanes[lane][shard(hash)].push_back({hash, id, payload, ingest});
             }
         });
     });

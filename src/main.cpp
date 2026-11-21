@@ -155,21 +155,38 @@ ResolvedPerson routed_alias(Text name, uint64_t packed, std::vector<Text>& raw_n
 
 class LinkedIds {
     struct Node {
-        Text name;
         uint32_t parent, size;
     };
+    static_assert(sizeof(Node) == 8);
+    using Edge = std::array<uint32_t, 2>;
+
+    struct PackedEndpoint {
+        const char* name;
+        uint64_t key;
+        size_t destination;
+
+        Text text() const { return {name, (key & packed_eight_tag) != 0 ? size_t{8} : size_t{9}}; }
+    };
+    static_assert(sizeof(PackedEndpoint) == 24);
+
     std::vector<Node> nodes;
-    PackedAliasIndex packed_ids;
+    std::vector<Text> alias_names;
+    std::vector<PackedAliasIndex> packed_ids;
     StringIndex other_ids;
     std::vector<size_t> canonical;
     std::array<std::vector<Text>, partitions> names_by_partition;
 
-    uint32_t index(Text id) {
-        const uint64_t packed = pack_short_id(id);
-        const auto [i, inserted] = packed == nonpacked_id
-            ? other_ids.try_add(id, text_hash(id), nodes.size())
-            : packed_ids.try_add(packed, nodes.size());
-        if (inserted) nodes.push_back({id, i, 1});
+    uint32_t next_index() const {
+        if (nodes.size() >= StringIndex::missing) throw std::overflow_error("too many linked aliases");
+        return static_cast<uint32_t>(nodes.size());
+    }
+
+    uint32_t register_alias(Text id, std::pair<uint32_t, bool> result) {
+        const auto [i, inserted] = result;
+        if (inserted) {
+            nodes.push_back({i, 1});
+            alias_names.push_back(id);
+        }
         return i;
     }
     uint32_t root(uint32_t i) {
@@ -178,51 +195,92 @@ class LinkedIds {
         }
         return i;
     }
-    void join(Text a, Text b) {
-        uint32_t first = root(index(a));
-        uint32_t second = root(index(b));
+    void join(const Edge& edge) {
+        uint32_t first = root(edge[0]);
+        uint32_t second = root(edge[1]);
         if (first == second) return;
         if (nodes[first].size < nodes[second].size) std::swap(first, second);
         nodes[second].parent = first;
         nodes[first].size += nodes[second].size;
-        nodes[first].name = std::min(nodes[first].name, nodes[second].name);
     }
 
-    static size_t estimate_ids(const std::vector<input::Mapping>& links) {
-        size_t bytes = 0;
-        for (const auto& file : links) bytes += file.bytes().size();
-        // Reserve a starting capacity, with normal growth for different ID
-        // lengths and link shapes. Cap the estimate for unusually long rows.
-        return std::min<size_t>(bytes / 16, 4 * 1024 * 1024);
+    void build_forest(const std::vector<input::Mapping>& links, size_t bytes, size_t expected_aliases) {
+        constexpr size_t edge_reserve_limit = 4 * 1024 * 1024;
+        const size_t endpoint_hint = std::min(bytes / 8, 2 * edge_reserve_limit);
+        const size_t per_shard = (endpoint_hint + partitions - 1) / partitions;
+        std::array<std::vector<PackedEndpoint>, partitions> endpoints;
+        std::vector<Edge> edges;
+        edges.reserve(std::min(bytes / 18, edge_reserve_limit));
+        for (const auto& file : links) {
+            input::lookup<2>(file, [&](const auto& row) {
+                if (row[0].empty() || row[1].empty()) return;
+                const size_t ordinal = edges.size();
+                auto& edge = edges.emplace_back();
+                for (size_t side = 0; side < row.size(); ++side) {
+                    const Text name = row[side];
+                    const uint64_t packed = pack_short_id(name);
+                    if (packed == nonpacked_id) {
+                        edge[side] = register_alias(name, other_ids.try_add(name, text_hash(name), next_index()));
+                    } else {
+                        auto& pending = endpoints[shard(packed_alias_hash(packed))];
+                        if (pending.capacity() == 0) pending.reserve(per_shard);
+                        // One size_t token includes the side. The Edge array's
+                        // element width already bounds ordinal below SIZE_MAX/2.
+                        pending.push_back({name.data(), packed, 2 * ordinal + side});
+                    }
+                }
+            });
+        }
+        const size_t alias_hint = (expected_aliases + partitions - 1) / partitions;
+        packed_ids.reserve(partitions);
+        for (auto& pending : endpoints) {
+            auto& ids = packed_ids.emplace_back(std::min(alias_hint, pending.size()), std::countr_zero(partitions));
+            for (const auto& endpoint : pending) {
+                const auto node = register_alias(endpoint.text(), ids.try_add(endpoint.key, next_index()));
+                edges[endpoint.destination / 2][endpoint.destination % 2] = node;
+            }
+            std::vector<PackedEndpoint>().swap(pending);
+        }
+        for (const auto& edge : edges) join(edge);
     }
 
 public:
-    explicit LinkedIds(const std::vector<input::Mapping>& links) : packed_ids(estimate_ids(links)) {
-        nodes.reserve(estimate_ids(links));
-        for (const auto& file : links) {
-            input::lookup<2>(file, [&](const auto& row) {
-                if (!row[0].empty() && !row[1].empty()) join(row[0], row[1]);
-            });
+    explicit LinkedIds(const std::vector<input::Mapping>& links) {
+        size_t bytes = 0;
+        for (const auto& file : links) bytes += file.bytes().size();
+        const size_t expected = std::min<size_t>(bytes / 16, 4 * 1024 * 1024);
+        nodes.reserve(expected);
+        alias_names.reserve(expected);
+        build_forest(links, bytes, expected);
+        // The forest is now fixed. Compress to final roots while reducing
+        // names into root slots; a non-root slot still holds its original ID.
+        for (uint32_t i = 0; i < nodes.size(); ++i) {
+            auto& node = nodes[i];
+            if (node.parent == i) continue;
+            node.parent = root(node.parent);
+            auto& name = alias_names[node.parent];
+            if (alias_names[i] < name) name = alias_names[i];
         }
         canonical.resize(nodes.size());
         for (uint32_t i = 0; i < nodes.size(); ++i) {
             if (nodes[i].parent != i) continue;
-            const Text name = nodes[i].name;
+            const Text name = alias_names[i];
             const size_t part = shard(text_hash(name));
             auto& names = names_by_partition[part];
             canonical[i] = names.size() * partitions + part;
             names.push_back(name);
         }
-        for (uint32_t i = 0; i < nodes.size(); ++i) canonical[i] = canonical[root(i)];
-        packed_ids.resolve(canonical);
+        for (uint32_t i = 0; i < nodes.size(); ++i) canonical[i] = canonical[nodes[i].parent];
+        for (auto& ids : packed_ids) ids.resolve(canonical);
         if (other_ids.empty()) std::vector<size_t>().swap(canonical);
         std::vector<Node>().swap(nodes);
+        std::vector<Text>().swap(alias_names);
     }
     ResolvedPerson person(PersonKey alias, size_t alias_partition, const RawNameLanes& raw_names) const {
         uint64_t code;
         if (alias.packed()) {
             const uint64_t key = alias.packed_key();
-            code = packed_ids.find(key, packed_alias_hash(key));
+            code = packed_ids[alias_partition].find(key, packed_alias_hash(key));
             if (code == PackedAliasIndex::missing) return {alias, alias_partition};
         } else {
             const Text name = alias.raw_name(raw_names);

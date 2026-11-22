@@ -61,6 +61,21 @@ constexpr uint64_t name_kind_mask = uint64_t{7} << 61;
 constexpr uint64_t linked_name_tag = uint64_t{5} << 61;
 constexpr uint64_t raw_name_tag = uint64_t{6} << 61;
 constexpr uint64_t name_handle_mask = ~name_kind_mask;
+constexpr uint64_t direct_text_tag = uint64_t{7} << 61;
+constexpr uint64_t address_mask = (uint64_t{1} << 48) - 1;
+
+// Input mappings outlive grouping and output. Encode a small string_view
+// directly when both components fit, leaving UINT64_MAX for invalid events.
+uint64_t direct_text(Text name) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(name.data());
+    if (address > address_mask || name.size() >= (uint64_t{1} << 13) - 1) return 0;
+    return direct_text_tag | (static_cast<uint64_t>(name.size()) << 48) | address;
+}
+
+Text unpack_direct_text(uint64_t key) {
+    return {reinterpret_cast<const char*>(static_cast<uintptr_t>(key & address_mask)),
+            static_cast<size_t>((key & name_handle_mask) >> 48)};
+}
 
 uint64_t pack_short_id(Text id) {
     if (id.size() == 9) {
@@ -102,6 +117,7 @@ public:
     static PersonKey from_packed(uint64_t name) { return PersonKey(name); }
 
     static PersonKey from_raw(Text name, std::vector<Text>& names, size_t lane) {
+        if (const uint64_t key = direct_text(name)) return PersonKey(key);
         if (names.size() > name_handle_mask / partitions) {
             throw std::overflow_error("too many raw person names");
         }
@@ -116,6 +132,7 @@ public:
     size_t ordinal() const { return value & name_handle_mask; }
 
     Text raw_name(const RawNameLanes& names) const {
+        if ((value & name_kind_mask) == direct_text_tag) return unpack_direct_text(value);
         const uint64_t handle = value & name_handle_mask;
         return names[shard(handle)][handle / partitions];
     }
@@ -429,12 +446,13 @@ struct PackedPurchase {
     uint32_t price, category;
 };
 
-// Raw alias handles are local to the parsing lane. Dedup compares only
-// event IDs and times. Routing later reads the originating lane's Text view.
+// Carry an exact raw alias view until the winning event gets routed.
+// Views outside the inline range use the originating lane's sidecar.
 uint64_t pack_candidate_alias(const ParsedAlias& alias, std::vector<Text>& raw_names) {
     if (alias.empty()) return PackedCandidate::invalid_alias;
     const uint64_t key = pack_parsed_alias(alias);
     if (key != nonpacked_id) return key;
+    if (const uint64_t direct = direct_text(alias.text())) return direct;
     if (raw_names.size() > name_handle_mask) {
         throw std::overflow_error("too many raw candidate aliases");
     }
@@ -622,9 +640,12 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<Time
             const auto route = [&](const PackedCandidate& row, uint32_t price, uint32_t category) {
                 const uint64_t alias = row.alias;
                 if (alias == PackedCandidate::invalid_alias) return;
-                const auto destination = (alias & name_kind_mask) == raw_name_tag
-                    ? routed_alias(candidate_names[alias & name_handle_mask], nonpacked_id, raw_names, worker)
-                    : routed_alias(alias);
+                const auto destination = [&] {
+                    if (alias < raw_name_tag) return routed_alias(alias);
+                    const Text name = (alias & name_kind_mask) == direct_text_tag
+                        ? unpack_direct_text(alias) : candidate_names[alias & name_handle_mask];
+                    return routed_alias(name, nonpacked_id, raw_names, worker);
+                }();
                 events[destination.partition].push_back({destination.key,
                     TimelineEvent::make(row.event_time(origin), price, category, origin.event_ms)});
             };

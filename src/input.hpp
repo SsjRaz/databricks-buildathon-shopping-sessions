@@ -269,39 +269,106 @@ bool shaped_event_row(const char* row, unsigned length, uint64_t commas, uint64_
     fn(record);
     return true;
 }
+
+// The masks are cut at the first newline, or the end of the caller's row.
+// A valid record has six commas and every quote is one of a field's pair.
+template<class Fn>
+void variable_event_row(const char* row, unsigned length, const std::array<uint64_t, 3>& commas,
+                        unsigned quotes, Fn& fn) {
+    if (std::popcount(commas[0]) + std::popcount(commas[1]) + std::popcount(commas[2]) != 6) return;
+
+    std::array<unsigned, 7> ends;
+    size_t delimiter = 0;
+    for (unsigned word = 0; word < commas.size(); ++word) {
+        for (uint64_t mask = commas[word]; mask != 0; mask &= mask - 1) {
+            ends[delimiter++] = word * 64 + std::countr_zero(mask);
+        }
+    }
+    ends[6] = length;
+
+    std::array<Text, 7> record;
+    unsigned begin = 0;
+    unsigned endpoint_quotes = 0;
+    for (size_t field = 0; field < record.size(); ++field) {
+        const unsigned end = ends[field];
+        unsigned trim = 0;
+        if (quotes != 0 && end != begin && row[begin] == '"') {
+            if (end - begin < 2 || row[end - 1] != '"') return;
+            trim = 1;
+            endpoint_quotes += 2;
+        }
+        record[field] = Text(row + begin + trim, end - begin - 2 * trim);
+        begin = end + 1;
+    }
+    if (endpoint_quotes == quotes) fn(record);
+}
 #endif
 
 template<class Fn>
 void read_events(Text bytes, Fn&& fn) {
 #if defined(__AVX2__) && defined(__BMI2__)
+    const auto join = [](uint32_t first, uint32_t second) {
+        return first | (uint64_t{second} << 32);
+    };
     while (bytes.size() >= 96) {
         const char* row = bytes.data();
         const auto a = event_delimiters(row);
-        const auto b = event_delimiters(row+32);
-        const auto c = event_delimiters(row+64);
-        const uint64_t lf = a.newline | (uint64_t{b.newline} << 32);
-        size_t length;
+        const auto b = event_delimiters(row + 32);
+        const auto c = event_delimiters(row + 64);
+        const uint64_t lf = join(a.newline, b.newline);
         if (lf || c.newline) {
             const unsigned n = lf ? std::countr_zero(lf) : 64 + std::countr_zero(c.newline);
             const auto low = low_bits(n);
             const auto high = n > 64 ? low_bits(n - 64) : 0;
-            const auto join = [](uint32_t first, uint32_t second) {
-                return first | (uint64_t{second} << 32);
-            };
-            if (shaped_event_row(row, n, join(a.comma, b.comma) & low, c.comma & high,
-                                 join(a.quote, b.quote) & low, c.quote & high, fn)) {
-                bytes.remove_prefix(n+1);
+            const uint64_t commas = join(a.comma, b.comma) & low;
+            const uint64_t tail_commas = c.comma & high;
+            const uint64_t quotes = join(a.quote, b.quote) & low;
+            const uint64_t tail_quotes = c.quote & high;
+            if (!shaped_event_row(row, n, commas, tail_commas, quotes, tail_quotes, fn)) {
+                variable_event_row(row, n, {commas, tail_commas, 0},
+                                   std::popcount(quotes) + std::popcount(tail_quotes), fn);
+            }
+            bytes.remove_prefix(n + 1);
+            continue;
+        }
+
+        size_t scanned = 96;
+        if (bytes.size() >= 128) {
+            const auto d = event_delimiters(row + 96);
+            const uint64_t commas = join(a.comma, b.comma);
+            const uint64_t middle_commas = join(c.comma, d.comma);
+            const unsigned prefix_quotes = std::popcount(a.quote) + std::popcount(b.quote);
+            const uint64_t middle_quotes = join(c.quote, d.quote);
+            if (d.newline) {
+                const unsigned n = 96 + std::countr_zero(d.newline);
+                const uint64_t middle = low_bits(n - 64);
+                variable_event_row(row, n, {commas, middle_commas & middle, 0},
+                                   prefix_quotes + std::popcount(middle_quotes & middle), fn);
+                bytes.remove_prefix(n + 1);
                 continue;
             }
-            length = n;
-        } else {
-            const char* last = find_byte(row + 96, row + bytes.size(), '\n');
-            length = static_cast<size_t>(last - row);
+            scanned = 128;
+            if (bytes.size() >= 160) {
+                const auto e = event_delimiters(row + 128);
+                if (e.newline) {
+                    const unsigned n = 128 + std::countr_zero(e.newline);
+                    const uint64_t tail = low_bits(n - 128);
+                    variable_event_row(row, n, {commas, middle_commas, e.comma & tail},
+                                       prefix_quotes + std::popcount(middle_quotes) +
+                                           std::popcount(e.quote & tail), fn);
+                    bytes.remove_prefix(n + 1);
+                    continue;
+                }
+                scanned = 160;
+            }
         }
+
+        const char* last = find_byte(row + scanned, row + bytes.size(), '\n');
+        const size_t length = static_cast<size_t>(last - row);
         std::array<Text, 7> record;
         if (fields(Text(row, length), record)) fn(record);
         if (length == bytes.size()) return;
-        bytes.remove_prefix(length+1);
+        bytes.remove_prefix(length + 1);
     }
 #endif
     read<7>(bytes, std::forward<Fn>(fn));

@@ -99,6 +99,49 @@ uint64_t pack_short_id(Text id) {
 #endif
 }
 
+// Eight-byte packed IDs occupy only 0x80xx..., and nine-byte IDs have
+// their top bit clear. This tag occupies neither short-ID domain.
+constexpr uint64_t opaque_alias_tag = uint64_t{9} << 60;
+
+bool is_opaque_alias(uint64_t key) { return key >> 60 == 9; }
+size_t opaque_slot(uint64_t key) { return key ^ opaque_alias_tag; }
+
+class OpaqueAliases {
+    static constexpr size_t max_slots = 4 * 1024 * 1024;
+    static constexpr size_t probes = 12;
+    const size_t capacity;
+    std::unique_ptr<std::atomic<const char*>[]> names;
+
+public:
+    explicit OpaqueAliases(size_t event_bytes)
+        : capacity(std::bit_ceil(std::clamp(event_bytes / 4096, partitions, max_slots))),
+          names(std::make_unique<std::atomic<const char*>[]>(capacity)) {}
+
+    size_t size() const { return capacity; }
+
+    // All input mappings outlive this table. Once occupied, a slot never
+    // changes. Two copies of a name probe the same slots in the same order;
+    // exhausting the whole probe sequence fixes that name on the raw route.
+    uint64_t intern(Text name) {
+        if (name.size() != 33) return nonpacked_id;
+        size_t slot = text_hash(name) & (capacity - 1);
+        for (size_t i = 0; i < probes; ++i) {
+            const char* other = names[slot].load(std::memory_order_relaxed);
+            if (!other && names[slot].compare_exchange_strong(other, name.data(),
+                                                              std::memory_order_relaxed)) {
+                return opaque_alias_tag | slot;
+            }
+            if (other == name.data() || std::memcmp(other, name.data(), 33) == 0) {
+                return opaque_alias_tag | slot;
+            }
+            slot = (slot + 1) & (capacity - 1);
+        }
+        return nonpacked_id;
+    }
+
+    Text text(size_t slot) const { return {names[slot].load(std::memory_order_relaxed), 33}; }
+};
+
 using RawNameLanes = std::vector<std::vector<Text>>;
 using DecodedNames = std::deque<std::array<char, 9>>;
 
@@ -127,7 +170,9 @@ public:
     }
 
     bool linked() const { return (value & name_kind_mask) == linked_name_tag; }
-    bool packed() const { return value < linked_name_tag; }
+    bool packed() const { return value < opaque_alias_tag; }
+    bool opaque() const { return is_opaque_alias(value); }
+    size_t slot() const { return opaque_slot(value); }
     uint64_t packed_key() const { return value; }
     size_t ordinal() const { return value & name_handle_mask; }
 
@@ -165,8 +210,15 @@ ResolvedPerson routed_alias(uint64_t packed) {
     return {PersonKey::from_packed(packed), shard(packed_alias_hash(packed))};
 }
 
-ResolvedPerson routed_alias(Text name, uint64_t packed, std::vector<Text>& raw_names, size_t lane) {
+ResolvedPerson routed_opaque(uint64_t key) {
+    return {PersonKey::from_packed(key), shard(key)};
+}
+
+ResolvedPerson routed_alias(Text name, uint64_t packed, std::vector<Text>& raw_names, size_t lane,
+                            OpaqueAliases& opaque) {
     if (packed != nonpacked_id) return routed_alias(packed);
+    const uint64_t key = opaque.intern(name);
+    if (key != nonpacked_id) return routed_opaque(key);
     return {PersonKey::from_raw(name, raw_names, lane), shard(text_hash(name))};
 }
 
@@ -190,6 +242,7 @@ class LinkedIds {
     std::vector<Text> alias_names;
     std::vector<PackedAliasIndex> packed_ids;
     StringIndex other_ids;
+    std::vector<uint32_t> opaque_nodes;
     std::vector<size_t> canonical;
     std::array<std::vector<Text>, partitions> names_by_partition;
 
@@ -221,7 +274,8 @@ class LinkedIds {
         nodes[first].size += nodes[second].size;
     }
 
-    void build_forest(const std::vector<input::Mapping>& links, size_t bytes, size_t expected_aliases) {
+    void build_forest(const std::vector<input::Mapping>& links, size_t bytes, size_t expected_aliases,
+                      OpaqueAliases& opaque) {
         constexpr size_t edge_reserve_limit = 4 * 1024 * 1024;
         const size_t endpoint_hint = std::min(bytes / 8, 2 * edge_reserve_limit);
         const size_t per_shard = (endpoint_hint + partitions - 1) / partitions;
@@ -237,7 +291,15 @@ class LinkedIds {
                     const Text name = row[side];
                     const uint64_t packed = pack_short_id(name);
                     if (packed == nonpacked_id) {
-                        edge[side] = register_alias(name, other_ids.try_add(name, text_hash(name), next_index()));
+                        const uint64_t key = opaque.intern(name);
+                        if (key != nonpacked_id) {
+                            if (opaque_nodes.empty()) opaque_nodes.assign(opaque.size(), StringIndex::missing);
+                            auto& node = opaque_nodes[opaque_slot(key)];
+                            if (node == StringIndex::missing) node = register_alias(name, {next_index(), true});
+                            edge[side] = node;
+                        } else {
+                            edge[side] = register_alias(name, other_ids.try_add(name, text_hash(name), next_index()));
+                        }
                     } else {
                         auto& pending = endpoints[shard(packed_alias_hash(packed))];
                         if (pending.capacity() == 0) pending.reserve(per_shard);
@@ -262,13 +324,13 @@ class LinkedIds {
     }
 
 public:
-    explicit LinkedIds(const std::vector<input::Mapping>& links) {
+    LinkedIds(const std::vector<input::Mapping>& links, OpaqueAliases& opaque) {
         size_t bytes = 0;
         for (const auto& file : links) bytes += file.bytes().size();
         const size_t expected = std::min<size_t>(bytes / 16, 4 * 1024 * 1024);
         nodes.reserve(expected);
         alias_names.reserve(expected);
-        build_forest(links, bytes, expected);
+        build_forest(links, bytes, expected, opaque);
         // The forest is now fixed. Compress to final roots while reducing
         // names into root slots; a non-root slot still holds its original ID.
         for (uint32_t i = 0; i < nodes.size(); ++i) {
@@ -289,7 +351,7 @@ public:
         }
         for (uint32_t i = 0; i < nodes.size(); ++i) canonical[i] = canonical[nodes[i].parent];
         for (auto& ids : packed_ids) ids.resolve(canonical);
-        if (other_ids.empty()) std::vector<size_t>().swap(canonical);
+        if (other_ids.empty() && opaque_nodes.empty()) std::vector<size_t>().swap(canonical);
         std::vector<Node>().swap(nodes);
         std::vector<Text>().swap(alias_names);
     }
@@ -299,6 +361,11 @@ public:
             const uint64_t key = alias.packed_key();
             code = packed_ids[alias_partition].find(key, packed_alias_hash(key));
             if (code == PackedAliasIndex::missing) return {alias, alias_partition};
+        } else if (alias.opaque()) {
+            if (opaque_nodes.empty()) return {alias, alias_partition};
+            const uint32_t node = opaque_nodes[alias.slot()];
+            if (node == StringIndex::missing) return {alias, alias_partition};
+            code = canonical[node];
         } else {
             const Text name = alias.raw_name(raw_names);
             const uint32_t index = other_ids.find(name, text_hash(name));
@@ -448,10 +515,12 @@ struct PackedPurchase {
 
 // Carry an exact raw alias view until the winning event gets routed.
 // Views outside the inline range use the originating lane's sidecar.
-uint64_t pack_candidate_alias(const ParsedAlias& alias, std::vector<Text>& raw_names) {
+uint64_t pack_candidate_alias(const ParsedAlias& alias, std::vector<Text>& raw_names, OpaqueAliases& opaque) {
     if (alias.empty()) return PackedCandidate::invalid_alias;
     const uint64_t key = pack_parsed_alias(alias);
     if (key != nonpacked_id) return key;
+    const uint64_t interned = opaque.intern(alias.text());
+    if (interned != nonpacked_id) return interned;
     if (const uint64_t direct = direct_text(alias.text())) return direct;
     if (raw_names.size() > name_handle_mask) {
         throw std::overflow_error("too many raw candidate aliases");
@@ -579,7 +648,7 @@ CandidatePayload event_payload(const std::array<Text, 7>& row, input::Window win
 template<class Row, class TimelineEvent>
 void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<TimelineEvent>>& events,
                  std::vector<Text>& raw_names, size_t worker, TimeOrigins origin,
-                 const RawNameLanes& raw_candidate_names,
+                 const RawNameLanes& raw_candidate_names, OpaqueAliases& opaque,
                  std::span<Shards<PackedPurchase>> purchases = {}) {
     constexpr bool packed = std::is_same_v<Row, PackedCandidate>;
     const auto earlier = [&](const Row& candidate, const Row& winner) {
@@ -641,10 +710,12 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<Time
                 const uint64_t alias = row.alias;
                 if (alias == PackedCandidate::invalid_alias) return;
                 const auto destination = [&] {
-                    if (alias < raw_name_tag) return routed_alias(alias);
+                    if (alias < opaque_alias_tag) return routed_alias(alias);
+                    if (is_opaque_alias(alias)) return routed_opaque(alias);
                     const Text name = (alias & name_kind_mask) == direct_text_tag
                         ? unpack_direct_text(alias) : candidate_names[alias & name_handle_mask];
-                    return routed_alias(name, nonpacked_id, raw_names, worker);
+                    // This raw alias already failed admission during parsing.
+                    return ResolvedPerson{PersonKey::from_raw(name, raw_names, worker), shard(text_hash(name))};
                 }();
                 events[destination.partition].push_back({destination.key,
                     TimelineEvent::make(row.event_time(origin), price, category, origin.event_ms)});
@@ -669,7 +740,7 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<Time
                 const auto& winner = row.payload;
                 if (winner.user.empty()) continue;
                 const auto destination =
-                    routed_alias(winner.user.text(), pack_parsed_alias(winner.user), raw_names, worker);
+                    routed_alias(winner.user.text(), pack_parsed_alias(winner.user), raw_names, worker, opaque);
                 events[destination.partition].push_back({destination.key,
                     TimelineEvent::make(winner.time, winner.price, winner.category, origin.event_ms)});
             }
@@ -679,14 +750,15 @@ void deduplicate(std::vector<Shards<Row>>& lanes, size_t part, Shards<Event<Time
 }
 
 void read_clicks(Text chunk, Shards<Click>& clicks, const Lookups& lookups, input::Window window,
-                 std::vector<Text>& raw_names, size_t worker, std::deque<Text>& wide_ids) {
+                 std::vector<Text>& raw_names, size_t worker, std::deque<Text>& wide_ids,
+                 OpaqueAliases& opaque) {
     input::read<4>(chunk, [&](const auto& row) {
         if (row[0].empty() || row[1].empty()) return;
         const int64_t time = input::timestamp(row[3]);
         if (time < window.start - input::week_ms || time >= window.end) return;
         const auto campaign = lookups.campaigns.find(row[2]);
         if (campaign == lookups.campaigns.end()) return;
-        const auto destination = routed_alias(row[1], pack_short_id(row[1]), raw_names, worker);
+        const auto destination = routed_alias(row[1], pack_short_id(row[1]), raw_names, worker, opaque);
         const TimedClick click = make_timed_click(row[0], time, campaign->second, wide_ids);
         clicks[destination.partition].push_back({destination.key, click});
     });
@@ -721,7 +793,7 @@ template<class TimelineEvent>
 AliasStorage<TimelineEvent> group_aliases(std::vector<Shards<Event<TimelineEvent>>>& event_lanes,
                                          std::vector<Shards<Click>>& click_lanes, size_t part,
                                          const RawNameLanes& raw_names, const LinkedIds& linked,
-                                         FragmentShards<TimelineEvent>& fragments) {
+                                         const OpaqueAliases& opaque, FragmentShards<TimelineEvent>& fragments) {
     size_t event_count = 0, click_count = 0;
     for (const auto& lane : event_lanes) event_count += lane[part].size();
     for (const auto& lane : click_lanes) click_count += lane[part].size();
@@ -731,11 +803,20 @@ AliasStorage<TimelineEvent> group_aliases(std::vector<Shards<Event<TimelineEvent
     // All packed aliases here share the low hash bits used by routing.
     const size_t row_count = event_count + click_count;
     PackedAliasIndex packed_groups(row_count / 32, std::countr_zero(partitions));
-    StringIndex raw_groups(row_count / 256);
+    StringIndex raw_groups;
+    std::vector<uint32_t> opaque_groups;
     std::vector<AliasGroup> groups;
     const auto group_for = [&](PersonKey alias) {
         const auto [id, inserted] = [&] {
             if (alias.packed()) return packed_groups.try_add(alias.packed_key(), groups.size());
+            if (alias.opaque()) {
+                if (opaque_groups.empty()) opaque_groups.assign(opaque.size() / partitions, StringIndex::missing);
+                auto& group = opaque_groups[alias.slot() / partitions];
+                if (group != StringIndex::missing) return std::pair{group, false};
+                if (groups.size() >= StringIndex::missing) throw std::overflow_error("too many alias groups");
+                group = static_cast<uint32_t>(groups.size());
+                return std::pair{group, true};
+            }
             const Text name = alias.raw_name(raw_names);
             return raw_groups.try_add(name, text_hash(name), groups.size());
         }();
@@ -1015,7 +1096,8 @@ public:
 template<class TimelineEvent>
 void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partitions>& fragments,
                                 size_t part, std::span<const Text> linked_names, const RawNameLanes& raw_names,
-                                DecodedNames& decoded_names, const Lookups& lookups, input::Window window,
+                                DecodedNames& decoded_names, const OpaqueAliases& opaque,
+                                const Lookups& lookups, input::Window window,
                                 std::vector<UserDay>& users, CampaignTotals& campaigns) {
     const int64_t origin = window.start;
     Attribution attribution(lookups.campaign.size());
@@ -1214,7 +1296,7 @@ void summarize_person_fragments(std::array<FragmentShards<TimelineEvent>, partit
                 head = &fragment;
             } else {
                 const Text name = person.packed() ? decode_name(decoded_names, person.packed_key())
-                                                  : person.raw_name(raw_names);
+                    : person.opaque() ? opaque.text(person.slot()) : person.raw_name(raw_names);
                 summarize_timeline(name, fragment.events, fragment.clicks);
             }
         }
@@ -1322,6 +1404,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     // A capacity hint only. Vectors still grow normally for smaller rows or
     // uneven work distribution.
     const size_t candidate_hint = event_bytes / (64 * partitions * threads);
+    OpaqueAliases opaque(event_bytes);
     const TimeOrigins time_origin{window.start, window.start / 1000};
     std::vector<std::deque<WideCandidateTimes>> wide_candidate_times(threads);
     RawNameLanes raw_candidate_names(threads);
@@ -1334,13 +1417,13 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
 
     parallel(1 + event_chunks.size() + click_chunks.size(), threads, [&](size_t lane, size_t job) {
         if (job == 0) {
-            linked_ids = std::make_unique<LinkedIds>(link_files);
+            linked_ids = std::make_unique<LinkedIds>(link_files, opaque);
             return;
         }
         --job;
         if (job >= event_chunks.size()) {
             read_clicks(click_chunks[job - event_chunks.size()], click_lanes[lane],
-                        lookups, window, raw_names[lane], lane, wide_click_ids[lane]);
+                        lookups, window, raw_names[lane], lane, wide_click_ids[lane], opaque);
             return;
         }
         if (candidate_hint >= 1024 && packed_candidate_lanes[lane][0].capacity() == 0) {
@@ -1360,7 +1443,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
                         {candidates.size(), payload.price, payload.category});
                 }
                 const uint64_t times = pack_candidate_times(payload, time_origin, wide_candidate_times[lane]);
-                const uint64_t alias = pack_candidate_alias(payload.user, raw_candidate_names[lane]);
+                const uint64_t alias = pack_candidate_alias(payload.user, raw_candidate_names[lane], opaque);
                 candidates.push_back({packed, alias, times});
             } else {
                 const uint64_t hash = text_hash(id);
@@ -1386,9 +1469,9 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
                 for (auto& events : event_lanes[lane]) events.reserve(event_hint);
             }
             deduplicate(packed_candidate_lanes, part, event_lanes[lane], raw_names[lane], lane,
-                        time_origin, raw_candidate_names, packed_purchase_lanes);
+                        time_origin, raw_candidate_names, opaque, packed_purchase_lanes);
             deduplicate(candidate_lanes, part, event_lanes[lane], raw_names[lane], lane,
-                        time_origin, raw_candidate_names);
+                        time_origin, raw_candidate_names, opaque);
         });
         raw_candidate_names.clear();
         wide_candidate_times.clear();
@@ -1399,12 +1482,12 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         auto fragments = std::make_unique<std::array<FragmentShards<TimelineEvent>, partitions>>();
         parallel(partitions, threads, [&](size_t, size_t part) {
             alias_rows[part] = group_aliases<TimelineEvent>(
-                event_lanes, click_lanes, part, raw_names, linked, (*fragments)[part]);
+                event_lanes, click_lanes, part, raw_names, linked, opaque, (*fragments)[part]);
         });
         timer.mark("group aliases and resolve fragments");
         parallel(partitions, threads, [&](size_t lane, size_t part) {
             summarize_person_fragments<TimelineEvent>(
-                *fragments, part, linked.names(part), raw_names, decoded_names[part],
+                *fragments, part, linked.names(part), raw_names, decoded_names[part], opaque,
                 lookups, window, user_rows[part], campaign_totals[lane]);
         });
     };
